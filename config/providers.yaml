@@ -1,0 +1,25 @@
+providers:
+  virustotal:
+    enabled: false
+    requires_api_key: true
+
+  shodan:
+    enabled: false
+    requires_api_key: true
+
+  censys:
+    enabled: false
+    requires_api_key: true
+
+  urlscan:
+    enabled: false
+    requires_api_key: true
+
+collection:
+  timeout_seconds: 10
+  max_results_per_source: 50
+  public_only: true
+  authorized_only: true
+
+tracking:
+  default_interval_hours: 24
