@@ -1,4 +1,4 @@
-# OSINT Engine — SIH26151 Phase 2
+# OSINT Engine 
 
 Modular, evidence-first OSINT engine for lawful/public or explicitly authorized security research. It accepts crawler findings or manual identifiers, normalizes them, runs relevant scanners/providers, deduplicates findings, preserves provenance, generates JSON reports, and provides a foundation for watchlists and future Phase 3 correlation.
 
