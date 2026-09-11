@@ -1,0 +1,7 @@
+pydantic>=2.7,<3
+PyYAML>=6.0
+python-dotenv>=1.0
+requests>=2.31
+dnspython>=2.6
+reportlab>=4.0
+pytest>=8.0
