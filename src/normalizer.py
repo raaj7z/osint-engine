@@ -1,8 +1,3 @@
-"""Identifier normalization for the OSINT engine.
-
-Cleans up raw identifier values (whitespace, casing, formatting),
-auto-detects an identifier's type from its raw string form, and
-deduplicates identifier lists before they're handed to scanners.
 
 
 
