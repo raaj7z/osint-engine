@@ -6,6 +6,76 @@ from .models import InvestigationInput, InvestigationResult, Identifier
 
 class OSINTDatabase:
     """Additive SQLite adapter over the crawler's existing database."""
+        def _create_osint_tables(self):
+        """Create OSINT-specific tables missing from the crawler database."""
+
+        self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS actors (
+            id TEXT PRIMARY KEY,
+            investigation_id TEXT,
+            display_name TEXT,
+            category TEXT DEFAULT 'unknown',
+            confidence_level TEXT DEFAULT 'insufficient',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS identifiers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            investigation_id TEXT,
+            actor_id TEXT,
+            type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            normalized_value TEXT,
+            source TEXT DEFAULT 'manual',
+            source_url TEXT,
+            confidence REAL DEFAULT 0.5,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            investigation_id TEXT,
+            actor_id TEXT,
+            finding_type TEXT,
+            value TEXT,
+            normalized_value TEXT,
+            source TEXT,
+            source_url TEXT,
+            confidence REAL DEFAULT 0.0,
+            first_seen TIMESTAMP,
+            last_seen TIMESTAMP,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            investigation_id TEXT,
+            finding_id INTEGER,
+            source_url TEXT,
+            title TEXT,
+            excerpt TEXT,
+            content_hash TEXT,
+            collected_at TIMESTAMP,
+            metadata TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_actors_investigation
+            ON actors(investigation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_identifiers_investigation
+            ON identifiers(investigation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_findings_investigation
+            ON findings(investigation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_findings_actor
+            ON findings(actor_id);
+        """)
+
+        self.conn.commit()
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or os.getenv("OSINT_DB_PATH", "data/crawler.db")
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
