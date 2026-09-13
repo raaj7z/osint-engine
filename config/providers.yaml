@@ -1,25 +1,61 @@
+# config/providers.yaml
+#
+# Reference configuration for providers/scanners: required env vars,
+# supported identifier types, and known rate limits. engine.py (already
+# built) may or may not load this file directly — treat it as
+# documentation/reference until confirmed against the actual engine
+# implementation.
+
 providers:
   virustotal:
-    enabled: false
-    requires_api_key: true
+    module: src.providers.virustotal.VirusTotalProvider
+    env_key: VIRUSTOTAL_API_KEY
+    supported_types: [domain, url, ip]
+    rate_limit: "4 requests/minute (free tier)"
 
   shodan:
-    enabled: false
-    requires_api_key: true
-
-  censys:
-    enabled: false
-    requires_api_key: true
+    module: src.providers.shodan.ShodanProvider
+    env_key: SHODAN_API_KEY
+    supported_types: [ip, domain]
+    rate_limit: "depends on plan"
 
   urlscan:
-    enabled: false
-    requires_api_key: true
+    module: src.providers.urlscan.UrlscanProvider
+    env_key: URLSCAN_API_KEY
+    supported_types: [domain, url]
+    rate_limit: "depends on plan"
 
-collection:
-  timeout_seconds: 10
-  max_results_per_source: 50
-  public_only: true
-  authorized_only: true
+  abuseipdb:
+    module: src.providers.abuseipdb.AbuseIPDBProvider
+    env_key: ABUSEIPDB_API_KEY
+    supported_types: [ip]
+    rate_limit: "1000 requests/day (free tier)"
+
+  censys:
+    module: src.providers.censys.CensysProvider
+    env_keys: [CENSYS_API_ID, CENSYS_API_SECRET]
+    supported_types: [ip, domain]
+    rate_limit: "depends on plan"
+
+scanners:
+  ip:
+    module: src.scanners.ip.IpScanner
+    supported_types: [ip]
+    notes: "ip-api.com free tier is rate-limited to 45 req/min; scanner sleeps 1.5s between calls."
+
+  url:
+    module: src.scanners.url.URLScanner
+    supported_types: [url]
+
+  darkweb:
+    module: src.scanners.darkweb.DarkWebScanner
+    supported_types: [username, domain, url]
+    notes: "Passive queries against Ahmia and DarkSearch public indexes — no direct Tor connection."
 
 tracking:
-  default_interval_hours: 24
+  scheduler_check_interval_seconds: 300
+  default_watchlist_interval_hours: 6
+
+reports:
+  output_dir: reports/
+  types: [json, csv, html, network_report, threat_actor_report]
