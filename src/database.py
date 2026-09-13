@@ -359,7 +359,6 @@ class OSINTDatabase:
         self,
         crawler_investigation_id: int,
     ):
-
         row = self.conn.execute(
             """
             SELECT *
@@ -375,7 +374,6 @@ class OSINTDatabase:
         self,
         investigation_id: str,
     ):
-
         identifiers = []
 
         try:
@@ -459,7 +457,6 @@ class OSINTDatabase:
             ).fetchall()
 
             for row in rows:
-
                 target_url = row["target_url"]
 
                 if not target_url:
@@ -487,7 +484,6 @@ class OSINTDatabase:
         result = []
 
         for identifier in identifiers:
-
             key = (
                 identifier.type,
                 identifier.value.strip().lower(),
@@ -507,7 +503,6 @@ class OSINTDatabase:
     ) -> None:
 
         for item in identifiers:
-
             self.conn.execute(
                 """
                 INSERT INTO osint_identifiers
@@ -547,8 +542,9 @@ class OSINTDatabase:
                 ),
             )
 
-        self.conn.commit() 
-            def save_investigation(
+        self.conn.commit()
+
+    def save_investigation(
         self,
         result: InvestigationResult,
     ) -> None:
@@ -563,7 +559,6 @@ class OSINTDatabase:
         )
 
         for finding in result.findings:
-
             cursor = self.conn.execute(
                 """
                 INSERT INTO osint_findings
@@ -622,7 +617,6 @@ class OSINTDatabase:
                 )
                 or []
             ):
-
                 self.conn.execute(
                     """
                     INSERT INTO osint_evidence
@@ -678,7 +672,6 @@ class OSINTDatabase:
                 )
 
         try:
-
             self.conn.execute(
                 """
                 UPDATE investigations
@@ -718,7 +711,6 @@ class OSINTDatabase:
             pass
 
         try:
-
             self.conn.execute(
                 """
                 UPDATE sessions
@@ -744,9 +736,7 @@ class OSINTDatabase:
         self,
         limit: int = 50,
     ):
-
         try:
-
             rows = self.conn.execute(
                 """
                 SELECT
@@ -775,9 +765,7 @@ class OSINTDatabase:
         self,
         investigation_id: str,
     ):
-
         try:
-
             row = self.conn.execute(
                 """
                 SELECT *
@@ -830,7 +818,6 @@ class OSINTDatabase:
         investigation_id: str,
         job_type: str,
     ) -> str:
-
         job_id = str(uuid.uuid4())
 
         self.conn.execute(
@@ -862,7 +849,6 @@ class OSINTDatabase:
         progress: float | None = None,
         error: str | None = None,
     ) -> None:
-
         now = self._now()
 
         self.conn.execute(
@@ -912,7 +898,6 @@ class OSINTDatabase:
         level: str = "info",
         metadata: dict | None = None,
     ) -> None:
-
         self.conn.execute(
             """
             INSERT INTO osint_job_events
@@ -944,7 +929,6 @@ class OSINTDatabase:
         self,
         job_id: str,
     ):
-
         row = self.conn.execute(
             """
             SELECT *
@@ -961,7 +945,6 @@ class OSINTDatabase:
         job_id: str,
         after_id: int = 0,
     ):
-
         rows = self.conn.execute(
             """
             SELECT *
@@ -985,7 +968,6 @@ class OSINTDatabase:
         self,
         actor_id: str,
     ):
-
         rows = self.conn.execute(
             """
             SELECT *
@@ -999,13 +981,11 @@ class OSINTDatabase:
         result = []
 
         for row in rows:
-
             item = dict(row)
 
             metadata = item.get("metadata")
 
             if metadata:
-
                 try:
                     item["metadata"] = json.loads(
                         metadata
@@ -1028,7 +1008,6 @@ class OSINTDatabase:
         actor_id: str,
         output_path: str,
     ) -> str:
-
         rows = self.conn.execute(
             """
             SELECT
@@ -1077,7 +1056,6 @@ class OSINTDatabase:
             newline="",
             encoding="utf-8",
         ) as file:
-
             writer = csv.DictWriter(
                 file,
                 fieldnames=fieldnames,
@@ -1093,28 +1071,15 @@ class OSINTDatabase:
         return output_path
 
     def get_stats(self):
-
         def count(table: str) -> int:
             return self.conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0]
 
         return {
-            "actors": count(
-                "osint_actors"
-            ),
-            "identifiers": count(
-                "osint_identifiers"
-            ),
-            "findings": count(
-                "osint_findings"
-            ),
-            "evidence": count(
-                "osint_evidence"
-            ),
-            "jobs": count(
-                "osint_jobs"
-            ),
+            "actors": count("osint_actors"),
+            "identifiers": count("osint_identifiers"),
+            "findings": count("osint_findings"),
+            "evidence": count("osint_evidence"),
+            "jobs": count("osint_jobs"),
         }
- 
-
