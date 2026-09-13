@@ -1,184 +1,693 @@
 from __future__ import annotations
-import json, os, sqlite3, uuid
+
+import csv
+import json
+import os
+import sqlite3
+import uuid
 from datetime import datetime, timezone
 from typing import Any
-from .models import InvestigationInput, InvestigationResult, Identifier
+
+from .models import Identifier, InvestigationResult
+
 
 class OSINTDatabase:
-    """Additive SQLite adapter over the crawler's existing database."""
-        def _create_osint_tables(self):
-        """Create OSINT-specific tables missing from the crawler database."""
+    """Additive SQLite adapter for the OSINT engine."""
 
-        self.conn.executescript("""
-        CREATE TABLE IF NOT EXISTS actors (
-            id TEXT PRIMARY KEY,
-            investigation_id TEXT,
-            display_name TEXT,
-            category TEXT DEFAULT 'unknown',
-            confidence_level TEXT DEFAULT 'insufficient',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS identifiers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            investigation_id TEXT,
-            actor_id TEXT,
-            type TEXT NOT NULL,
-            value TEXT NOT NULL,
-            normalized_value TEXT,
-            source TEXT DEFAULT 'manual',
-            source_url TEXT,
-            confidence REAL DEFAULT 0.5,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS findings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            investigation_id TEXT,
-            actor_id TEXT,
-            finding_type TEXT,
-            value TEXT,
-            normalized_value TEXT,
-            source TEXT,
-            source_url TEXT,
-            confidence REAL DEFAULT 0.0,
-            first_seen TIMESTAMP,
-            last_seen TIMESTAMP,
-            metadata TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS evidence (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            investigation_id TEXT,
-            finding_id INTEGER,
-            source_url TEXT,
-            title TEXT,
-            excerpt TEXT,
-            content_hash TEXT,
-            collected_at TIMESTAMP,
-            metadata TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_actors_investigation
-            ON actors(investigation_id);
-
-        CREATE INDEX IF NOT EXISTS idx_identifiers_investigation
-            ON identifiers(investigation_id);
-
-        CREATE INDEX IF NOT EXISTS idx_findings_investigation
-            ON findings(investigation_id);
-
-        CREATE INDEX IF NOT EXISTS idx_findings_actor
-            ON findings(actor_id);
-        """)
-
-        self.conn.commit()
     def __init__(self, db_path: str | None = None):
-        self.db_path = db_path or os.getenv("OSINT_DB_PATH", "data/crawler.db")
-        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        self.db_path = db_path or os.getenv(
+            "OSINT_DB_PATH",
+            "data/crawler.db",
+        )
+
+        os.makedirs(
+            os.path.dirname(os.path.abspath(self.db_path)),
+            exist_ok=True,
+        )
+
+        self.conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=30,
+        )
+
         self.conn.row_factory = sqlite3.Row
+
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
 
-    def close(self): self.conn.close()
-    @staticmethod
-    def _now(): return datetime.now(timezone.utc).isoformat()
-    @staticmethod
-    def _json(v): return json.dumps(v, ensure_ascii=False, default=str)
+        # Create OSINT tables automatically.
+        self._create_osint_tables()
 
-    def migrate(self, schema_path: str):
-        with open(schema_path, "r", encoding="utf-8") as f: self.conn.executescript(f.read())
+    # ------------------------------------------------------------------
+    # Utility methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _json(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    def close(self) -> None:
+        self.conn.close()
+
+    # ------------------------------------------------------------------
+    # OSINT schema
+    # ------------------------------------------------------------------
+
+    def _create_osint_tables(self) -> None:
+        """Create OSINT-specific tables without modifying crawler tables."""
+
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS osint_actors (
+                id TEXT PRIMARY KEY,
+                investigation_id TEXT NOT NULL,
+                display_name TEXT,
+                category TEXT DEFAULT 'unknown',
+                confidence_level TEXT DEFAULT 'insufficient',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS osint_identifiers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                investigation_id TEXT NOT NULL,
+                actor_id TEXT,
+                type TEXT NOT NULL,
+                value TEXT NOT NULL,
+                normalized_value TEXT,
+                source TEXT DEFAULT 'manual',
+                source_url TEXT,
+                confidence REAL DEFAULT 0.5,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS osint_findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                investigation_id TEXT NOT NULL,
+                actor_id TEXT,
+                finding_type TEXT,
+                value TEXT,
+                normalized_value TEXT,
+                source TEXT,
+                source_url TEXT,
+                confidence REAL DEFAULT 0.0,
+                first_seen TIMESTAMP,
+                last_seen TIMESTAMP,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS osint_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                investigation_id TEXT NOT NULL,
+                finding_id INTEGER,
+                source_url TEXT,
+                title TEXT,
+                excerpt TEXT,
+                content_hash TEXT,
+                collected_at TIMESTAMP,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS osint_jobs (
+                id TEXT PRIMARY KEY,
+                investigation_id TEXT,
+                job_type TEXT NOT NULL,
+                status TEXT DEFAULT 'queued',
+                progress REAL DEFAULT 0.0,
+                error TEXT,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS osint_job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                investigation_id TEXT,
+                level TEXT DEFAULT 'info',
+                event_type TEXT,
+                message TEXT,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_osint_actors_investigation
+                ON osint_actors(investigation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_osint_identifiers_investigation
+                ON osint_identifiers(investigation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_osint_findings_investigation
+                ON osint_findings(investigation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_osint_findings_actor
+                ON osint_findings(actor_id);
+
+            CREATE INDEX IF NOT EXISTS idx_osint_evidence_finding
+                ON osint_evidence(finding_id);
+
+            CREATE INDEX IF NOT EXISTS idx_osint_jobs_investigation
+                ON osint_jobs(investigation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_osint_job_events_job
+                ON osint_job_events(job_id);
+            """
+        )
+
         self.conn.commit()
 
-    def create_investigation(self, target: str, target_type: str, source="manual", notes=None, actor_id=None):
-        iid = str(uuid.uuid4()); actor_id = actor_id or f"actor-{uuid.uuid4().hex[:12]}"
-        self.conn.execute("INSERT INTO sessions (session_id,target_username,urls_crawled,status) VALUES (?,?,?,'running')",
-                          (iid, target, self._json([target]) if target_type == "url" else "[]"))
-        self.conn.execute("INSERT INTO investigations (session_id,target_username,status,results) VALUES (?,?,'running',?)",
-                          (iid, target, self._json({"source":source,"target_type":target_type,"notes":notes})))
-        self.conn.execute("INSERT INTO actors (id,investigation_id,display_name,category,confidence_level) VALUES (?,? ,?,'unknown','insufficient')",
-                          (actor_id, iid, target))
-        self.conn.execute("INSERT INTO identifiers (investigation_id,actor_id,type,value,normalized_value,source) VALUES (?,?,?,?,?,?)",
-                          (iid, actor_id, target_type, target, target.strip().lower(), source))
-        self.conn.commit(); return iid, actor_id
+    # ------------------------------------------------------------------
+    # Schema migration
+    # ------------------------------------------------------------------
 
-    def get_crawler_investigation(self, crawler_investigation_id: int):
-        r = self.conn.execute("SELECT * FROM investigations WHERE id=?", (crawler_investigation_id,)).fetchone()
-        return dict(r) if r else None
+    def migrate(self, schema_path: str) -> None:
+        """Run an external SQL schema file."""
 
-    def ensure_actor_for_investigation(self, iid: str, display_name=None):
-        r = self.conn.execute("SELECT id FROM actors WHERE investigation_id=? ORDER BY created_at LIMIT 1", (iid,)).fetchone()
-        if r: return r[0]
-        aid=f"actor-{uuid.uuid4().hex[:12]}"
-        self.conn.execute("INSERT INTO actors (id,investigation_id,display_name,category,confidence_level) VALUES (?,? ,?,'unknown','insufficient')", (aid,iid,display_name)); self.conn.commit(); return aid
+        with open(
+            schema_path,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            self.conn.executescript(file.read())
 
-    def get_identifiers_from_crawler(self, iid: str):
-        out=[]
-        r=self.conn.execute("SELECT target_username FROM sessions WHERE session_id=?",(iid,)).fetchone()
-        if r and r[0]: out.append(Identifier(type="username",value=r[0],source="crawler"))
-        for r in self.conn.execute("SELECT username,source_url FROM usernames WHERE session_id=?",(iid,)):
-            if r[0]: out.append(Identifier(type="username",value=r[0],source="crawler",source_url=r[1]))
-        for r in self.conn.execute("SELECT currency,address,source_url FROM crypto_addresses WHERE session_id=?",(iid,)):
-            if r[1]: out.append(Identifier(type="crypto",value=r[1],source="crawler",source_url=r[2]))
-        for r in self.conn.execute("SELECT target_url,source_url FROM links WHERE session_id=?",(iid,)):
-            if r[0]: out.append(Identifier(type="url" if "://" in r[0] else "domain",value=r[0],source="crawler",source_url=r[1]))
-        seen=set(); result=[]
-        for x in out:
-            k=(x.type,x.value.strip().lower())
-            if k not in seen: seen.add(k); result.append(x)
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Investigation
+    # ------------------------------------------------------------------
+
+    def create_investigation(
+        self,
+        target: str,
+        target_type: str,
+        source: str = "manual",
+        notes: str | None = None,
+        actor_id: str | None = None,
+    ):
+        """Create an investigation and its initial actor."""
+
+        investigation_id = str(uuid.uuid4())
+
+        actor_id = actor_id or (
+            f"actor-{uuid.uuid4().hex[:12]}"
+        )
+
+        # These are crawler-compatible tables.
+        # CREATE IF NOT EXISTS prevents errors on a fresh OSINT database.
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT UNIQUE,
+                target_username TEXT,
+                urls_crawled TEXT,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                status TEXT DEFAULT 'running',
+                summary TEXT
+            )
+            """
+        )
+
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS investigations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                target_username TEXT,
+                status TEXT DEFAULT 'running',
+                results TEXT,
+                confidence_score REAL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+            """
+        )
+
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO sessions
+            (
+                session_id,
+                target_username,
+                urls_crawled,
+                status
+            )
+            VALUES (?, ?, ?, 'running')
+            """,
+            (
+                investigation_id,
+                target,
+                self._json([target])
+                if target_type == "url"
+                else "[]",
+            ),
+        )
+
+        self.conn.execute(
+            """
+            INSERT INTO investigations
+            (
+                session_id,
+                target_username,
+                status,
+                results
+            )
+            VALUES (?, ?, 'running', ?)
+            """,
+            (
+                investigation_id,
+                target,
+                self._json(
+                    {
+                        "source": source,
+                        "target_type": target_type,
+                        "notes": notes,
+                    }
+                ),
+            ),
+        )
+
+        self.conn.execute(
+            """
+            INSERT INTO osint_actors
+            (
+                id,
+                investigation_id,
+                display_name,
+                category,
+                confidence_level
+            )
+            VALUES (?, ?, ?, 'unknown', 'insufficient')
+            """,
+            (
+                actor_id,
+                investigation_id,
+                target,
+            ),
+        )
+
+        self.conn.execute(
+            """
+            INSERT INTO osint_identifiers
+            (
+                investigation_id,
+                actor_id,
+                type,
+                value,
+                normalized_value,
+                source
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                investigation_id,
+                actor_id,
+                target_type,
+                target,
+                target.strip().lower(),
+                source,
+            ),
+        )
+
+        self.conn.commit()
+
+        return investigation_id, actor_id
+
+    # ------------------------------------------------------------------
+    # Actor
+    # ------------------------------------------------------------------
+
+    def ensure_actor_for_investigation(
+        self,
+        investigation_id: str,
+        display_name: str | None = None,
+    ) -> str:
+        """Return an existing actor or create one."""
+
+        row = self.conn.execute(
+            """
+            SELECT id
+            FROM osint_actors
+            WHERE investigation_id = ?
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (investigation_id,),
+        ).fetchone()
+
+        if row:
+            return row["id"]
+
+        actor_id = (
+            f"actor-{uuid.uuid4().hex[:12]}"
+        )
+
+        self.conn.execute(
+            """
+            INSERT INTO osint_actors
+            (
+                id,
+                investigation_id,
+                display_name,
+                category,
+                confidence_level
+            )
+            VALUES (?, ?, ?, 'unknown', 'insufficient')
+            """,
+            (
+                actor_id,
+                investigation_id,
+                display_name,
+            ),
+        )
+
+        self.conn.commit()
+
+        return actor_id
+
+    # ------------------------------------------------------------------
+    # Crawler investigation
+    # ------------------------------------------------------------------
+
+    def get_crawler_investigation(
+        self,
+        crawler_investigation_id: int,
+    ):
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM investigations
+            WHERE id = ?
+            """,
+            (crawler_investigation_id,),
+        ).fetchone()
+
+        return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Crawler identifiers
+    # ------------------------------------------------------------------
+
+    def get_identifiers_from_crawler(
+        self,
+        investigation_id: str,
+    ):
+        """Extract identifiers from crawler output."""
+
+        identifiers = []
+
+        # Username from crawler session.
+        try:
+            row = self.conn.execute(
+                """
+                SELECT target_username
+                FROM sessions
+                WHERE session_id = ?
+                """,
+                (investigation_id,),
+            ).fetchone()
+
+            if row and row["target_username"]:
+                identifiers.append(
+                    Identifier(
+                        type="username",
+                        value=row["target_username"],
+                        source="crawler",
+                    )
+                )
+
+        except sqlite3.OperationalError:
+            pass
+
+        # Usernames.
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT username, source_url
+                FROM usernames
+                WHERE session_id = ?
+                """,
+                (investigation_id,),
+            ).fetchall()
+
+            for row in rows:
+                if row["username"]:
+                    identifiers.append(
+                        Identifier(
+                            type="username",
+                            value=row["username"],
+                            source="crawler",
+                            source_url=row["source_url"],
+                        )
+                    )
+
+        except sqlite3.OperationalError:
+            pass
+
+        # Crypto addresses.
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT address, source_url
+                FROM crypto_addresses
+                WHERE session_id = ?
+                """,
+                (investigation_id,),
+            ).fetchall()
+
+            for row in rows:
+                if row["address"]:
+                    identifiers.append(
+                        Identifier(
+                            type="crypto",
+                            value=row["address"],
+                            source="crawler",
+                            source_url=row["source_url"],
+                        )
+                    )
+
+        except sqlite3.OperationalError:
+            pass
+
+        # Links.
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT target_url, source_url
+                FROM links
+                WHERE session_id = ?
+                """,
+                (investigation_id,),
+            ).fetchall()
+
+            for row in rows:
+                target_url = row["target_url"]
+
+                if not target_url:
+                    continue
+
+                identifier_type = (
+                    "url"
+                    if "://" in target_url
+                    else "domain"
+                )
+
+                identifiers.append(
+                    Identifier(
+                        type=identifier_type,
+                        value=target_url,
+                        source="crawler",
+                        source_url=row["source_url"],
+                    )
+                )
+
+        except sqlite3.OperationalError:
+            pass
+
+        # Remove duplicates.
+        seen = set()
+        result = []
+
+        for identifier in identifiers:
+            key = (
+                identifier.type,
+                identifier.value.strip().lower(),
+            )
+
+            if key not in seen:
+                seen.add(key)
+                result.append(identifier)
+
         return result
 
-    def register_identifiers(self, iid: str, actor_id: str | None, identifiers):
+    # ------------------------------------------------------------------
+    # Identifier registration
+    # ------------------------------------------------------------------
+
+    def register_identifiers(
+        self,
+        investigation_id: str,
+        actor_id: str | None,
+        identifiers,
+    ) -> None:
+
         for item in identifiers:
             self.conn.execute(
-                "INSERT INTO identifiers (investigation_id,actor_id,type,value,normalized_value,source,source_url,confidence) VALUES (?,?,?,?,?,?,?,?)",
-                (iid, actor_id, item.type, item.value, item.value.strip().lower(), getattr(item, "source", "crawler"), getattr(item, "source_url", None), getattr(item, "confidence", 0.5)),
+                """
+                INSERT INTO osint_identifiers
+                (
+                    investigation_id,
+                    actor_id,
+                    type,
+                    value,
+                    normalized_value,
+                    source,
+                    source_url,
+                    confidence
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    investigation_id,
+                    actor_id,
+                    item.type,
+                    item.value,
+                    item.value.strip().lower(),
+                    getattr(
+                        item,
+                        "source",
+                        "crawler",
+                    ),
+                    getattr(
+                        item,
+                        "source_url",
+                        None,
+                    ),
+                    getattr(
+                        item,
+                        "confidence",
+                        0.5,
+                    ),
+                ),
             )
+
         self.conn.commit()
 
-    def save_investigation(self, result: InvestigationResult):
-        iid=result.investigation_id; aid=result.actor_id or self.ensure_actor_for_investigation(iid)
-        for f in result.findings:
-            cur=self.conn.execute("""INSERT INTO findings
-                (investigation_id,actor_id,finding_type,value,normalized_value,source,source_url,confidence,first_seen,last_seen,metadata)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (iid,aid,f.finding_type,f.value,f.value.strip().lower(),f.source,f.source_url,f.confidence,
-                getattr(f,"first_seen",None),getattr(f,"last_seen",None),self._json(getattr(f,"metadata",None) or {})))
-            fid=cur.lastrowid
-            for e in getattr(f,"evidence",[]) or []:
-                self.conn.execute("""INSERT INTO evidence
-                (investigation_id,finding_id,source_url,title,excerpt,content_hash,collected_at,metadata)
-                VALUES (?,?,?,?,?,?,?,?)""", (iid,fid,getattr(e,"source_url",None),getattr(e,"title",None),getattr(e,"excerpt",None),
-                getattr(e,"hash_sha256",None),getattr(e,"collected_at",None),self._json(getattr(e,"metadata",None) or {})))
-        self.conn.execute("UPDATE investigations SET status='completed',results=?,confidence_score=?,completed_at=? WHERE session_id=?",
-                          (self._json({"errors":result.errors,"finding_count":len(result.findings)}),max((f.confidence for f in result.findings),default=0.0),
-                           result.completed_at.isoformat() if result.completed_at else self._now(),iid))
-        self.conn.execute("UPDATE sessions SET status='completed',completed_at=? WHERE session_id=?",(result.completed_at.isoformat() if result.completed_at else self._now(),iid)); self.conn.commit()
+    # ------------------------------------------------------------------
+    # Save investigation results
+    # ------------------------------------------------------------------
 
-    def list_investigations(self,limit=50):
-        return [dict(r) for r in self.conn.execute("SELECT session_id AS investigation_id,target_username AS target,status,started_at,completed_at,confidence_score FROM investigations ORDER BY started_at DESC LIMIT ?",(limit,)).fetchall()]
+    def save_investigation(
+        self,
+        result: InvestigationResult,
+    ) -> None:
 
-    def get_investigation(self,iid):
-        r=self.conn.execute("SELECT * FROM investigations WHERE session_id=?",(iid,)).fetchone()
-        if not r:return None
-        d=dict(r); d["findings"]=[dict(x) for x in self.conn.execute("SELECT * FROM findings WHERE investigation_id=? ORDER BY created_at",(iid,)).fetchall()]
-        d["identifiers"]=[dict(x) for x in self.conn.execute("SELECT * FROM identifiers WHERE investigation_id=? ORDER BY created_at",(iid,)).fetchall()]; return d
+        investigation_id = result.investigation_id
 
-    def create_job(self,iid,job_type):
-        jid=str(uuid.uuid4()); self.conn.execute("INSERT INTO jobs (id,investigation_id,job_type,status) VALUES (?,?,?,'queued')",(jid,iid,job_type)); self.conn.commit(); return jid
-    def update_job(self,jid,status,progress=None,error=None):
-        self.conn.execute("""UPDATE jobs SET status=?,progress=COALESCE(?,progress),error=?,
-        started_at=CASE WHEN ?='running' AND started_at IS NULL THEN ? ELSE started_at END,
-        completed_at=CASE WHEN ? IN ('completed','failed') THEN ? ELSE completed_at END WHERE id=?""",
-        (status,progress,error,status,self._now(),status,self._now(),jid)); self.conn.commit()
-    def add_job_event(self,jid,iid,event_type,message,level="info",metadata=None):
-        self.conn.execute("INSERT INTO job_events (job_id,investigation_id,level,event_type,message,metadata) VALUES (?,?,?,?,?,?)",
-                          (jid,iid,level,event_type,message,self._json(metadata or {}))); self.conn.commit()
-    def get_job(self,jid):
-        r=self.conn.execute("SELECT * FROM jobs WHERE id=?",(jid,)).fetchone(); return dict(r) if r else None
-    def get_job_events(self,jid,after_id=0):
-        return [dict(r) for r in self.conn.execute("SELECT * FROM job_events WHERE job_id=? AND id>? ORDER BY id",(jid,after_id)).fetchall()]
+        actor_id = (
+            result.actor_id
+            or self.ensure_actor_for_investigation(
+                investigation_id
+            )
+        )
+
+        for finding in result.findings:
+
+            cursor = self.conn.execute(
+                """
+                INSERT INTO osint_findings
+                (
+                    investigation_id,
+                    actor_id,
+                    finding_type,
+                    value,
+                    normalized_value,
+                    source,
+                    source_url,
+                    confidence,
+                    first_seen,
+                    last_seen,
+                    metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    investigation_id,
+                    actor_id,
+                    finding.finding_type,
+                    finding.value,
+                    finding.value.strip().lower(),
+                    finding.source,
+                    finding.source_url,
+                    finding.confidence,
+                    getattr(
+                        finding,
+                        "first_seen",
+                        None,
+                    ),
+                    getattr(
+                        finding,
+                        "last_seen",
+                        None,
+                    ),
+                    self._json(
+                        getattr(
+                            finding,
+                            "metadata",
+                            None,
+                        )
+                        or {}
+                    ),
+                ),
+            )
+
+            finding_id = cursor.lastrowid
+
+            for evidence in (
+                getattr(
+                    finding,
+                    "evidence",
+                    [],
+                )
+                or []
+            ):
+
+                self.conn.execute(
+                    """
+                    INSERT INTO osint_evidence
+                    (
+                        investigation_id,
+                        finding_id,
+                        source_url,
+                        title,
+                        excerpt,
+                        content_hash,
+                        collected_at,
+                        metadata
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        investigation_id,
+                        finding_id,
+                        getattr(
+                            evidence,
+                            "source_url",
+                            None,
+                        ),
+                        getattr(
+                            evidenc
