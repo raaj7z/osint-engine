@@ -12,7 +12,7 @@ from .models import Identifier, InvestigationResult
 
 
 class OSINTDatabase:
-    """Additive SQLite adapter for the OSINT engine."""
+    """SQLite database adapter for the OSINT engine."""
 
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or os.getenv(
@@ -21,7 +21,9 @@ class OSINTDatabase:
         )
 
         os.makedirs(
-            os.path.dirname(os.path.abspath(self.db_path)),
+            os.path.dirname(
+                os.path.abspath(self.db_path)
+            ),
             exist_ok=True,
         )
 
@@ -38,12 +40,7 @@ class OSINTDatabase:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
 
-        # Create OSINT tables automatically.
         self._create_osint_tables()
-
-    # ------------------------------------------------------------------
-    # Utility methods
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _now() -> str:
@@ -60,12 +57,8 @@ class OSINTDatabase:
     def close(self) -> None:
         self.conn.close()
 
-    # ------------------------------------------------------------------
-    # OSINT schema
-    # ------------------------------------------------------------------
-
     def _create_osint_tables(self) -> None:
-        """Create OSINT-specific tables without modifying crawler tables."""
+        """Create OSINT-specific tables."""
 
         self.conn.executescript(
             """
@@ -169,12 +162,8 @@ class OSINTDatabase:
 
         self.conn.commit()
 
-    # ------------------------------------------------------------------
-    # Schema migration
-    # ------------------------------------------------------------------
-
     def migrate(self, schema_path: str) -> None:
-        """Run an external SQL schema file."""
+        """Execute an external SQL schema file."""
 
         with open(
             schema_path,
@@ -185,10 +174,6 @@ class OSINTDatabase:
 
         self.conn.commit()
 
-    # ------------------------------------------------------------------
-    # Investigation
-    # ------------------------------------------------------------------
-
     def create_investigation(
         self,
         target: str,
@@ -197,16 +182,12 @@ class OSINTDatabase:
         notes: str | None = None,
         actor_id: str | None = None,
     ):
-        """Create an investigation and its initial actor."""
-
         investigation_id = str(uuid.uuid4())
 
         actor_id = actor_id or (
             f"actor-{uuid.uuid4().hex[:12]}"
         )
 
-        # These are crawler-compatible tables.
-        # CREATE IF NOT EXISTS prevents errors on a fresh OSINT database.
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -327,16 +308,11 @@ class OSINTDatabase:
 
         return investigation_id, actor_id
 
-    # ------------------------------------------------------------------
-    # Actor
-    # ------------------------------------------------------------------
-
     def ensure_actor_for_investigation(
         self,
         investigation_id: str,
         display_name: str | None = None,
     ) -> str:
-        """Return an existing actor or create one."""
 
         row = self.conn.execute(
             """
@@ -379,14 +355,11 @@ class OSINTDatabase:
 
         return actor_id
 
-    # ------------------------------------------------------------------
-    # Crawler investigation
-    # ------------------------------------------------------------------
-
     def get_crawler_investigation(
         self,
         crawler_investigation_id: int,
     ):
+
         row = self.conn.execute(
             """
             SELECT *
@@ -398,19 +371,13 @@ class OSINTDatabase:
 
         return dict(row) if row else None
 
-    # ------------------------------------------------------------------
-    # Crawler identifiers
-    # ------------------------------------------------------------------
-
     def get_identifiers_from_crawler(
         self,
         investigation_id: str,
     ):
-        """Extract identifiers from crawler output."""
 
         identifiers = []
 
-        # Username from crawler session.
         try:
             row = self.conn.execute(
                 """
@@ -433,7 +400,6 @@ class OSINTDatabase:
         except sqlite3.OperationalError:
             pass
 
-        # Usernames.
         try:
             rows = self.conn.execute(
                 """
@@ -458,7 +424,6 @@ class OSINTDatabase:
         except sqlite3.OperationalError:
             pass
 
-        # Crypto addresses.
         try:
             rows = self.conn.execute(
                 """
@@ -483,7 +448,6 @@ class OSINTDatabase:
         except sqlite3.OperationalError:
             pass
 
-        # Links.
         try:
             rows = self.conn.execute(
                 """
@@ -495,6 +459,7 @@ class OSINTDatabase:
             ).fetchall()
 
             for row in rows:
+
                 target_url = row["target_url"]
 
                 if not target_url:
@@ -518,11 +483,11 @@ class OSINTDatabase:
         except sqlite3.OperationalError:
             pass
 
-        # Remove duplicates.
         seen = set()
         result = []
 
         for identifier in identifiers:
+
             key = (
                 identifier.type,
                 identifier.value.strip().lower(),
@@ -534,10 +499,6 @@ class OSINTDatabase:
 
         return result
 
-    # ------------------------------------------------------------------
-    # Identifier registration
-    # ------------------------------------------------------------------
-
     def register_identifiers(
         self,
         investigation_id: str,
@@ -546,6 +507,7 @@ class OSINTDatabase:
     ) -> None:
 
         for item in identifiers:
+
             self.conn.execute(
                 """
                 INSERT INTO osint_identifiers
@@ -585,13 +547,8 @@ class OSINTDatabase:
                 ),
             )
 
-        self.conn.commit()
-
-    # ------------------------------------------------------------------
-    # Save investigation results
-    # ------------------------------------------------------------------
-
-    def save_investigation(
+        self.conn.commit() 
+            def save_investigation(
         self,
         result: InvestigationResult,
     ) -> None:
@@ -690,4 +647,474 @@ class OSINTDatabase:
                             None,
                         ),
                         getattr(
-                            evidenc
+                            evidence,
+                            "title",
+                            None,
+                        ),
+                        getattr(
+                            evidence,
+                            "excerpt",
+                            None,
+                        ),
+                        getattr(
+                            evidence,
+                            "hash_sha256",
+                            None,
+                        ),
+                        getattr(
+                            evidence,
+                            "collected_at",
+                            None,
+                        ),
+                        self._json(
+                            getattr(
+                                evidence,
+                                "metadata",
+                                None,
+                            )
+                            or {}
+                        ),
+                    ),
+                )
+
+        try:
+
+            self.conn.execute(
+                """
+                UPDATE investigations
+                SET
+                    status = 'completed',
+                    results = ?,
+                    confidence_score = ?,
+                    completed_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    self._json(
+                        {
+                            "errors": result.errors,
+                            "finding_count": len(
+                                result.findings
+                            ),
+                        }
+                    ),
+                    max(
+                        (
+                            finding.confidence
+                            for finding in result.findings
+                        ),
+                        default=0.0,
+                    ),
+                    (
+                        result.completed_at.isoformat()
+                        if result.completed_at
+                        else self._now()
+                    ),
+                    investigation_id,
+                ),
+            )
+
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET
+                    status = 'completed',
+                    completed_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    result.completed_at.isoformat()
+                    if result.completed_at
+                    else self._now(),
+                    investigation_id,
+                ),
+            )
+
+        except sqlite3.OperationalError:
+            pass
+
+        self.conn.commit()
+
+    def list_investigations(
+        self,
+        limit: int = 50,
+    ):
+
+        try:
+
+            rows = self.conn.execute(
+                """
+                SELECT
+                    session_id AS investigation_id,
+                    target_username AS target,
+                    status,
+                    started_at,
+                    completed_at,
+                    confidence_score
+                FROM investigations
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+            return [
+                dict(row)
+                for row in rows
+            ]
+
+        except sqlite3.OperationalError:
+            return []
+
+    def get_investigation(
+        self,
+        investigation_id: str,
+    ):
+
+        try:
+
+            row = self.conn.execute(
+                """
+                SELECT *
+                FROM investigations
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (investigation_id,),
+            ).fetchone()
+
+        except sqlite3.OperationalError:
+            row = None
+
+        if not row:
+            return None
+
+        data = dict(row)
+
+        data["findings"] = [
+            dict(item)
+            for item in self.conn.execute(
+                """
+                SELECT *
+                FROM osint_findings
+                WHERE investigation_id = ?
+                ORDER BY created_at
+                """,
+                (investigation_id,),
+            ).fetchall()
+        ]
+
+        data["identifiers"] = [
+            dict(item)
+            for item in self.conn.execute(
+                """
+                SELECT *
+                FROM osint_identifiers
+                WHERE investigation_id = ?
+                ORDER BY created_at
+                """,
+                (investigation_id,),
+            ).fetchall()
+        ]
+
+        return data
+
+    def create_job(
+        self,
+        investigation_id: str,
+        job_type: str,
+    ) -> str:
+
+        job_id = str(uuid.uuid4())
+
+        self.conn.execute(
+            """
+            INSERT INTO osint_jobs
+            (
+                id,
+                investigation_id,
+                job_type,
+                status
+            )
+            VALUES (?, ?, ?, 'queued')
+            """,
+            (
+                job_id,
+                investigation_id,
+                job_type,
+            ),
+        )
+
+        self.conn.commit()
+
+        return job_id
+
+    def update_job(
+        self,
+        job_id: str,
+        status: str,
+        progress: float | None = None,
+        error: str | None = None,
+    ) -> None:
+
+        now = self._now()
+
+        self.conn.execute(
+            """
+            UPDATE osint_jobs
+            SET
+                status = ?,
+                progress = COALESCE(?, progress),
+                error = ?,
+                started_at =
+                    CASE
+                        WHEN ?
+                             = 'running'
+                             AND started_at IS NULL
+                        THEN ?
+                        ELSE started_at
+                    END,
+                completed_at =
+                    CASE
+                        WHEN ?
+                             IN ('completed', 'failed')
+                        THEN ?
+                        ELSE completed_at
+                    END
+            WHERE id = ?
+            """,
+            (
+                status,
+                progress,
+                error,
+                status,
+                now,
+                status,
+                now,
+                job_id,
+            ),
+        )
+
+        self.conn.commit()
+
+    def add_job_event(
+        self,
+        job_id: str,
+        investigation_id: str,
+        event_type: str,
+        message: str,
+        level: str = "info",
+        metadata: dict | None = None,
+    ) -> None:
+
+        self.conn.execute(
+            """
+            INSERT INTO osint_job_events
+            (
+                job_id,
+                investigation_id,
+                level,
+                event_type,
+                message,
+                metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                investigation_id,
+                level,
+                event_type,
+                message,
+                self._json(
+                    metadata or {}
+                ),
+            ),
+        )
+
+        self.conn.commit()
+
+    def get_job(
+        self,
+        job_id: str,
+    ):
+
+        row = self.conn.execute(
+            """
+            SELECT *
+            FROM osint_jobs
+            WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+        return dict(row) if row else None
+
+    def get_job_events(
+        self,
+        job_id: str,
+        after_id: int = 0,
+    ):
+
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM osint_job_events
+            WHERE job_id = ?
+              AND id > ?
+            ORDER BY id
+            """,
+            (
+                job_id,
+                after_id,
+            ),
+        ).fetchall()
+
+        return [
+            dict(row)
+            for row in rows
+        ]
+
+    def get_previous_findings(
+        self,
+        actor_id: str,
+    ):
+
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM osint_findings
+            WHERE actor_id = ?
+            ORDER BY created_at
+            """,
+            (actor_id,),
+        ).fetchall()
+
+        result = []
+
+        for row in rows:
+
+            item = dict(row)
+
+            metadata = item.get("metadata")
+
+            if metadata:
+
+                try:
+                    item["metadata"] = json.loads(
+                        metadata
+                    )
+
+                except (
+                    TypeError,
+                    json.JSONDecodeError,
+                ):
+                    item["metadata"] = {}
+
+            item.pop("id", None)
+
+            result.append(item)
+
+        return result
+
+    def export_csv(
+        self,
+        actor_id: str,
+        output_path: str,
+    ) -> str:
+
+        rows = self.conn.execute(
+            """
+            SELECT
+                investigation_id,
+                actor_id,
+                finding_type,
+                value,
+                source,
+                source_url,
+                confidence,
+                first_seen,
+                last_seen,
+                metadata,
+                created_at
+            FROM osint_findings
+            WHERE actor_id = ?
+            ORDER BY created_at
+            """,
+            (actor_id,),
+        ).fetchall()
+
+        os.makedirs(
+            os.path.dirname(
+                os.path.abspath(output_path)
+            ),
+            exist_ok=True,
+        )
+
+        fieldnames = [
+            "investigation_id",
+            "actor_id",
+            "finding_type",
+            "value",
+            "source",
+            "source_url",
+            "confidence",
+            "first_seen",
+            "last_seen",
+            "metadata",
+            "created_at",
+        ]
+
+        with open(
+            output_path,
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as file:
+
+            writer = csv.DictWriter(
+                file,
+                fieldnames=fieldnames,
+            )
+
+            writer.writeheader()
+
+            for row in rows:
+                writer.writerow(
+                    dict(row)
+                )
+
+        return output_path
+
+    def get_stats(self):
+
+        def count(table: str) -> int:
+            return self.conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+
+        return {
+            "actors": count(
+                "osint_actors"
+            ),
+            "identifiers": count(
+                "osint_identifiers"
+            ),
+            "findings": count(
+                "osint_findings"
+            ),
+            "evidence": count(
+                "osint_evidence"
+            ),
+            "jobs": count(
+                "osint_jobs"
+            ),
+        }
+ 
+
