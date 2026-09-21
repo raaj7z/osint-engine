@@ -1,112 +1,190 @@
-"""Background scheduler for automatic re-scanning of watchlisted actors."""
+from __future__ import annotations
 
 import threading
-import time
-from datetime import datetime, timedelta, timezone
-
-from ..models import Finding, Identifier, InvestigationInput
-from .watchlist import WatchlistEntry
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 
-class ScanScheduler:
-    """Runs in a background thread, periodically re-scanning actors due for a check."""
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    def __init__(self, engine, watchlist_store, alert_manager, change_detector):
-        """Wire up the scheduler with the engine and tracking components it depends on."""
-        self.engine = engine
-        self.store = watchlist_store
-        self.alerts = alert_manager
-        self.detector = change_detector
-        self._running = False
-        self._thread: threading.Thread | None = None
-        self._check_interval_seconds = 300
 
-    def start(self) -> None:
-        """Start the background scheduling thread."""
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        print("Scheduler started — checking every 5 minutes")
-
-    def stop(self) -> None:
-        """Stop the background scheduling thread."""
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        print("Scheduler stopped")
-
-    def _loop(self) -> None:
-        """Main loop: check for due actors, scan them, then sleep."""
-        while self._running:
-            try:
-                due = self.store.due_for_scan()
-                for entry in due:
-                    try:
-                        self._scan_actor(entry)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            time.sleep(self._check_interval_seconds)
-
-    def _get_previous_findings(self, actor_id: str) -> list[Finding]:
-        """Fetch prior findings for an actor from the engine's database, if available."""
-        db = getattr(self.engine, "db", None)
-        if not db:
-            return []
-        try:
-            raw = db.get_previous_findings(actor_id)
-            return [
-                Finding(**{k: v for k, v in r.items() if k in Finding.model_fields})
-                for r in raw
-            ]
-        except Exception:
-            return []
-
-    def _scan_actor(self, entry: WatchlistEntry) -> None:
-        """Re-scan a single watchlisted actor, detect changes, and raise alerts for new findings."""
-        previous = self._get_previous_findings(entry.actor_id)
-
-        identifiers = [
-            Identifier(type=i["type"], value=i["value"]) for i in entry.identifiers
-        ]
-
-        investigation = InvestigationInput(
-            investigation_id=f"SCHED-{entry.actor_id}-{int(time.time())}",
-            actor_id=entry.actor_id,
-            identifiers=identifiers,
+class WatchlistScheduler:
+    def __init__(
+        self,
+        watchlist_store: Any,
+        callback: Callable[
+            [dict[str, Any]],
+            Any,
+        ],
+        alert_manager: Any = None,
+        tick_seconds: int = 15,
+    ):
+        self.watchlist_store = watchlist_store
+        self.callback = callback
+        self.alert_manager = alert_manager
+        self.tick_seconds = max(
+            1,
+            int(tick_seconds),
         )
 
-        result = self.engine.run(investigation)
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
 
-        diffs = self.detector.detect(previous, result.findings)
+        self.running_state = False
+        self.last_tick_at: str | None = None
+        self.last_error: str | None = None
+        self.last_results: list[dict[str, Any]] = []
 
-        for finding in diffs["added"]:
-            self.alerts.create_alert(entry.actor_id, entry.handle, finding)
+    def start(self) -> bool:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return False
 
-        self.store.update_scan_time(entry.actor_id)
+            self.stop_event.clear()
+            self.running_state = True
+            self.last_error = None
 
-        db = getattr(self.engine, "db", None)
-        if db:
-            try:
-                db.save_investigation(result)
-            except Exception:
-                pass
+            self.thread = threading.Thread(
+                target=self._loop,
+                name="pralayx-watchlist-scheduler",
+                daemon=True,
+            )
 
-    def status(self) -> dict:
-        """Return the scheduler's current running state and tracked-actor count."""
-        next_check = (
-            datetime.now(timezone.utc) + timedelta(seconds=self._check_interval_seconds)
-        ).isoformat()
+            self.thread.start()
+
+            return True
+
+    def stop(
+        self,
+        timeout: float = 5.0,
+    ) -> bool:
+        self.stop_event.set()
+
+        thread = self.thread
+
+        if (
+            thread
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(
+                timeout=max(
+                    0.1,
+                    float(timeout),
+                )
+            )
+
+        self.running_state = False
+
+        return not (
+            thread
+            and thread.is_alive()
+        )
+
+    def running(self) -> bool:
+        return bool(
+            self.thread
+            and self.thread.is_alive()
+            and self.running_state
+        )
+
+    def tick(self) -> list[dict[str, Any]]:
+        self.last_tick_at = utc_now()
+
+        processed: list[dict[str, Any]] = []
+
         try:
-            tracked = len(self.store.all_active())
-        except Exception:
-            tracked = 0
+            due_entries = self.watchlist_store.due()
+        except Exception as exc:
+            self.last_error = str(exc)
+            return []
 
-        return {
-            "running": self._running,
-            "next_check": next_check,
-            "tracked": tracked,
+        for entry in due_entries:
+            result = self._process(entry)
+            processed.append(result)
+
+        self.last_results = processed
+
+        return processed
+
+    def _process(
+        self,
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        watch_id = entry.get("watch_id")
+        actor_id = entry.get("actor_id")
+
+        result: dict[str, Any] = {
+            "watch_id": watch_id,
+            "actor_id": actor_id,
+            "started_at": utc_now(),
+            "status": "RUNNING",
         }
+
+        try:
+            value = self.callback(entry)
+
+            result["status"] = "COMPLETED"
+            result["result"] = value
+
+            if watch_id:
+                try:
+                    self.watchlist_store.mark_scanned(
+                        watch_id,
+                    )
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            error = str(exc)
+
+            result["status"] = "ERROR"
+            result["error"] = error
+            self.last_error = error
+
+            if self.alert_manager is not None:
+                try:
+                    self.alert_manager.create_monitoring_error(
+                        actor_id=actor_id,
+                        message=(
+                            f"Scheduled monitoring failed "
+                            f"for actor {actor_id}: {error}"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+        result["finished_at"] = utc_now()
+
+        return result
+
+    def _loop(self) -> None:
+        while not self.stop_event.wait(
+            self.tick_seconds
+        ):
+            try:
+                self.tick()
+            except Exception as exc:
+                self.last_error = str(exc)
+
+        self.running_state = False
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "running": self.running(),
+            "tick_seconds": self.tick_seconds,
+            "last_tick_at": self.last_tick_at,
+            "last_error": self.last_error,
+            "last_results": self.last_results,
+        }
+
+
+Scheduler = WatchlistScheduler
+
+
+__all__ = [
+    "WatchlistScheduler",
+    "Scheduler",
+]
