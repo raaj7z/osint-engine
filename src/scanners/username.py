@@ -1,9 +1,3 @@
-"""
-Username scanner using locally installed OSINT tools.
-
-The scanner only records publicly returned profile URLs.
-"""
-
 from __future__ import annotations
 
 import json
@@ -11,7 +5,6 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Any
 
 from .base import Scanner
 from ..models import Evidence, Finding
@@ -21,48 +14,47 @@ class UsernameScanner(Scanner):
     name = "username"
     supported_types = {"username"}
 
-    def scan(self, identifier, investigation_id, actor_id):
-        username = identifier.value.strip().lstrip("@")
+    def scan(
+        self,
+        identifier,
+        investigation_id,
+        actor_id=None,
+        run_id=None,
+    ):
+        username = (
+            identifier.value
+            .strip()
+            .lstrip("@")
+        )
 
         if not username:
             return []
 
         results = []
-        errors = []
 
-        found, error = self._sherlock(
+        found, _ = self._sherlock(
             username,
             investigation_id,
             actor_id,
+            run_id,
         )
         results.extend(found)
 
-        if error:
-            errors.append(error)
-
-        found, error = self._maigret(
+        found, _ = self._maigret(
             username,
             investigation_id,
             actor_id,
+            run_id,
         )
         results.extend(found)
 
-        if error:
-            errors.append(error)
-
-        found, error = self._blackbird(
+        found, _ = self._blackbird(
             username,
             investigation_id,
             actor_id,
+            run_id,
         )
         results.extend(found)
-
-        if error:
-            errors.append(error)
-
-        # Do not silently hide scanner failures.
-        for error in errors:
-            print(f"[ERROR] username scanner: {error}")
 
         return self._deduplicate(results)
 
@@ -70,6 +62,7 @@ class UsernameScanner(Scanner):
     def _make_finding(
         investigation_id,
         actor_id,
+        run_id,
         username,
         source,
         url,
@@ -79,6 +72,7 @@ class UsernameScanner(Scanner):
         return Finding(
             investigation_id=investigation_id,
             actor_id=actor_id,
+            run_id=run_id,
             finding_type="username",
             value=username,
             source=source,
@@ -101,17 +95,13 @@ class UsernameScanner(Scanner):
             },
         )
 
-    # ---------------------------------------------------------
-    # SHERLOCK
-    # ---------------------------------------------------------
-
-    def _sherlock(self, username, investigation_id, actor_id):
-        """
-        Run Sherlock and extract profile URLs from its output.
-        """
-
-        results = []
-
+    def _sherlock(
+        self,
+        username,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
             process = subprocess.run(
                 [
@@ -125,38 +115,34 @@ class UsernameScanner(Scanner):
                 text=True,
                 timeout=180,
             )
-
         except FileNotFoundError:
             return [], "Sherlock executable not found in PATH"
-
         except subprocess.TimeoutExpired:
             return [], "Sherlock timed out"
-
         except Exception as exc:
             return [], f"Sherlock failed: {exc}"
 
-        stdout = process.stdout or ""
-        stderr = process.stderr or ""
+        combined = (
+            (process.stdout or "")
+            + "\n"
+            + (process.stderr or "")
+        )
 
-        combined_output = stdout + "\n" + stderr
-
-        # Sherlock normally returns 0 when successful and may return
-        # non-zero for some execution conditions.
         if process.returncode not in (0, 1):
             return [], (
                 f"Sherlock exited with code "
                 f"{process.returncode}: "
-                f"{self._short(combined_output)}"
+                f"{self._short(combined)}"
             )
 
-        for raw_line in combined_output.splitlines():
+        results = []
 
+        for raw_line in combined.splitlines():
             line = raw_line.strip()
 
             if "[+]" not in line:
                 continue
 
-            # Extract any URL from the result line.
             urls = re.findall(
                 r"https?://[^\s\]\[<>\"']+",
                 line,
@@ -167,72 +153,59 @@ class UsernameScanner(Scanner):
 
             url = urls[-1].rstrip(".,)")
 
-            if not self._looks_like_profile_url(
-                url,
-                username,
-            ):
+            if not self._looks_like_profile_url(url):
                 continue
-
-            platform = self._platform_from_url(url)
 
             results.append(
                 self._make_finding(
                     investigation_id,
                     actor_id,
+                    run_id,
                     username,
                     "sherlock",
                     url,
                     0.75,
-                    platform,
+                    self._platform_from_url(url),
                 )
             )
 
         return results, None
 
-    # ---------------------------------------------------------
-    # MAIGRET
-    # ---------------------------------------------------------
-
-    def _maigret(self, username, investigation_id, actor_id):
-        """
-        Run Maigret and parse its JSON output.
-        """
-
-        results = []
-
+    def _maigret(
+        self,
+        username,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         fd, temp_path = tempfile.mkstemp(
             prefix="maigret_",
             suffix=".json",
         )
-
         os.close(fd)
 
         try:
-            process = subprocess.run(
-                [
-                    "maigret",
-                    username,
-                    "--json",
-                    temp_path,
-                    "--timeout",
-                    "10",
-                    "--no-progressbar",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=240,
-            )
-
-        except FileNotFoundError:
-            return [], "Maigret executable not found in PATH"
-
-        except subprocess.TimeoutExpired:
-            return [], "Maigret timed out"
-
-        except Exception as exc:
-            return [], f"Maigret failed: {exc}"
-
-        try:
+            try:
+                process = subprocess.run(
+                    [
+                        "maigret",
+                        username,
+                        "--json",
+                        temp_path,
+                        "--timeout",
+                        "10",
+                        "--no-progressbar",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=240,
+                )
+            except FileNotFoundError:
+                return [], "Maigret executable not found in PATH"
+            except subprocess.TimeoutExpired:
+                return [], "Maigret timed out"
+            except Exception as exc:
+                return [], f"Maigret failed: {exc}"
 
             if (
                 not os.path.exists(temp_path)
@@ -244,20 +217,22 @@ class UsernameScanner(Scanner):
                     or ""
                 )
 
-                if detail:
-                    return [], (
-                        "Maigret produced no JSON output: "
-                        + detail
-                    )
+                return [], (
+                    "Maigret produced no JSON output"
+                    + (f": {detail}" if detail else "")
+                )
 
-                return [], "Maigret produced no JSON output"
-
-            with open(
-                temp_path,
-                "r",
-                encoding="utf-8",
-            ) as file:
-                data = json.load(file)
+            try:
+                with open(
+                    temp_path,
+                    "r",
+                    encoding="utf-8",
+                ) as file:
+                    data = json.load(file)
+            except json.JSONDecodeError as exc:
+                return [], (
+                    f"Maigret returned invalid JSON: {exc}"
+                )
 
             if not isinstance(data, dict):
                 return [], (
@@ -265,33 +240,21 @@ class UsernameScanner(Scanner):
                     "top-level format"
                 )
 
-            # Support both:
-            #
-            # {
-            #     "sites": {...}
-            # }
-            #
-            # and:
-            #
-            # {
-            #     "Twitter": {...},
-            #     "GitHub": {...}
-            # }
+            sites = data.get("sites")
 
-            if isinstance(
-                data.get("sites"),
-                dict,
-            ):
-                sites = data["sites"]
-            else:
+            if not isinstance(sites, dict):
                 sites = data
 
-            for site, info in sites.items():
+            results = []
 
+            for site, info in sites.items():
                 if not isinstance(info, dict):
                     continue
 
-                status = info.get("status", {})
+                status = info.get(
+                    "status",
+                    {},
+                )
 
                 if isinstance(status, dict):
                     status_value = status.get(
@@ -313,22 +276,26 @@ class UsernameScanner(Scanner):
                 if not url:
                     continue
 
-                claimed = status_text in {
-                    "claimed",
-                    "found",
-                    "true",
-                    "200",
-                    "available",
-                }
+                claimed = (
+                    status_text
+                    in {
+                        "claimed",
+                        "found",
+                        "true",
+                        "200",
+                        "available",
+                    }
+                    or bool(info.get("claimed"))
+                )
 
                 if not claimed:
-                    if not info.get("claimed", False):
-                        continue
+                    continue
 
                 results.append(
                     self._make_finding(
                         investigation_id,
                         actor_id,
+                        run_id,
                         username,
                         "maigret",
                         url,
@@ -357,11 +324,6 @@ class UsernameScanner(Scanner):
 
             return results, None
 
-        except json.JSONDecodeError as exc:
-            return [], (
-                f"Maigret returned invalid JSON: {exc}"
-            )
-
         except Exception as exc:
             return [], (
                 f"Maigret result parsing failed: {exc}"
@@ -373,17 +335,13 @@ class UsernameScanner(Scanner):
             except OSError:
                 pass
 
-    # ---------------------------------------------------------
-    # BLACKBIRD
-    # ---------------------------------------------------------
-
-    def _blackbird(self, username, investigation_id, actor_id):
-        """
-        Query Blackbird's public endpoint when available.
-        """
-
-        results = []
-
+    def _blackbird(
+        self,
+        username,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
             import requests
 
@@ -422,8 +380,9 @@ class UsernameScanner(Scanner):
                     "unexpected format"
                 )
 
-            for item in items:
+            results = []
 
+            for item in items:
                 if not isinstance(item, dict):
                     continue
 
@@ -442,6 +401,7 @@ class UsernameScanner(Scanner):
                     self._make_finding(
                         investigation_id,
                         actor_id,
+                        run_id,
                         username,
                         "blackbird",
                         url,
@@ -460,38 +420,20 @@ class UsernameScanner(Scanner):
                 f"Blackbird request failed: {exc}"
             )
 
-    # ---------------------------------------------------------
-    # HELPERS
-    # ---------------------------------------------------------
-
     @staticmethod
-    def _looks_like_profile_url(
-        url: str,
-        username: str,
-    ) -> bool:
-        """
-        Keep normal HTTP/HTTPS profile URLs.
-        """
-
+    def _looks_like_profile_url(url):
         if not url:
             return False
 
-        lower_url = url.lower()
+        value = url.lower()
 
-        if (
-            lower_url.startswith("https://")
-            or lower_url.startswith("http://")
-        ):
-            return True
-
-        return False
+        return (
+            value.startswith("https://")
+            or value.startswith("http://")
+        )
 
     @staticmethod
-    def _platform_from_url(url: str) -> str:
-        """
-        Extract hostname from a URL.
-        """
-
+    def _platform_from_url(url):
         match = re.match(
             r"https?://(?:www\.)?([^/]+)",
             url,
@@ -504,13 +446,9 @@ class UsernameScanner(Scanner):
 
     @staticmethod
     def _short(
-        text: str,
-        limit: int = 240,
-    ) -> str:
-        """
-        Make an error message short enough for CLI output.
-        """
-
+        text,
+        limit=240,
+    ):
         text = " ".join(
             text.split()
         )
@@ -521,18 +459,11 @@ class UsernameScanner(Scanner):
         return text
 
     @staticmethod
-    def _deduplicate(
-        findings: list[Finding],
-    ) -> list[Finding]:
-        """
-        Remove duplicate source/URL combinations.
-        """
-
+    def _deduplicate(findings):
         seen = set()
         result = []
 
         for finding in findings:
-
             key = (
                 finding.source,
                 finding.source_url
