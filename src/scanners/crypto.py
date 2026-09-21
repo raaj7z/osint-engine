@@ -1,222 +1,488 @@
-# crypto.py — Crypto wallet scanner
-# Uses: Blockchain.info (BTC), Etherscan (ETH), Blockchair (multi), XMRChain (XMR)
+from __future__ import annotations
 
-import requests, os, re
+import os
+import re
+
+import requests
+
 from .base import Scanner
-from ..models import Finding, Evidence
+from ..models import Evidence, Finding
+
 
 class CryptoScanner(Scanner):
     name = "crypto"
     supported_types = {"crypto"}
 
-    # Regex to detect wallet type from address format
     WALLET_PATTERNS = {
-        "bitcoin":   r"^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$",
+        "bitcoin": r"^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$",
         "bitcoin_bech32": r"^bc1[a-z0-9]{39,59}$",
-        "ethereum":  r"^0x[a-fA-F0-9]{40}$",
-        "monero":    r"^4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}$",
-        "litecoin":  r"^[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}$",
+        "ethereum": r"^0x[a-fA-F0-9]{40}$",
+        "monero": r"^4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}$",
+        "litecoin": r"^[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}$",
     }
 
-    def scan(self, identifier, investigation_id, actor_id):
+    def scan(
+        self,
+        identifier,
+        investigation_id,
+        actor_id=None,
+        run_id=None,
+    ):
         address = identifier.value.strip()
         wallet_type = self._detect_type(address)
+
+        if wallet_type == "unknown":
+            return []
+
         results = []
 
         if wallet_type in ("bitcoin", "bitcoin_bech32"):
-            results += self._blockchain_info(address, investigation_id, actor_id)
-            results += self._bitcoin_abuse(address, investigation_id, actor_id)
+            results += self._blockchain_info(
+                address,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
+            results += self._bitcoin_abuse(
+                address,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
 
         elif wallet_type == "ethereum":
-            results += self._etherscan(address, investigation_id, actor_id)
+            results += self._etherscan(
+                address,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
 
         elif wallet_type == "monero":
-            results += self._xmrchain(address, investigation_id, actor_id)
+            results += self._xmrchain(
+                address,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
 
-        # Blockchair covers BTC, ETH, LTC and more
         if wallet_type != "monero":
-            results += self._blockchair(address, wallet_type, investigation_id, actor_id)
+            results += self._blockchair(
+                address,
+                wallet_type,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
 
         return results
 
     def _detect_type(self, address):
-        for wtype, pattern in self.WALLET_PATTERNS.items():
+        for wallet_type, pattern in self.WALLET_PATTERNS.items():
             if re.match(pattern, address):
-                return wtype
+                return wallet_type
         return "unknown"
 
-    def _blockchain_info(self, address, iid, aid):
-        out = []
+    def _blockchain_info(
+        self,
+        address,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
-            r = requests.get(
+            response = requests.get(
                 f"https://blockchain.info/rawaddr/{address}",
-                params={"limit": 5}, timeout=10
+                params={"limit": 5},
+                timeout=10,
             )
-            if r.status_code == 200:
-                data = r.json()
-                out.append(Finding(
-                    investigation_id=iid, actor_id=aid,
-                    finding_type="crypto", value=address,
+
+            if response.status_code != 200:
+                return []
+
+            data = response.json()
+
+            balance_satoshi = data.get("final_balance", 0)
+            transactions = data.get("txs", [])
+
+            return [
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type="crypto",
+                    value=address,
                     source="blockchain.info",
-                    source_url=f"https://www.blockchain.com/btc/address/{address}",
+                    source_url=(
+                        f"https://www.blockchain.com/btc/address/"
+                        f"{address}"
+                    ),
                     confidence=0.95,
-                    evidence=[Evidence(
-                        source="blockchain.info",
-                        title=f"Bitcoin wallet: {address[:20]}...",
-                        excerpt=f"Balance: {data.get('final_balance',0)/1e8:.8f} BTC | Txns: {data.get('n_tx',0)}"
-                    )],
+                    evidence=[
+                        Evidence(
+                            source="blockchain.info",
+                            source_url=(
+                                f"https://www.blockchain.com/btc/address/"
+                                f"{address}"
+                            ),
+                            title=(
+                                f"Bitcoin wallet: "
+                                f"{address[:20]}..."
+                            ),
+                            excerpt=(
+                                f"Balance: "
+                                f"{balance_satoshi / 1e8:.8f} BTC | "
+                                f"Txns: {data.get('n_tx', 0)}"
+                            ),
+                        )
+                    ],
                     metadata={
                         "wallet_type": "bitcoin",
-                        "balance_satoshi": data.get("final_balance", 0),
-                        "balance_btc": data.get("final_balance", 0) / 1e8,
-                        "total_received": data.get("total_received", 0) / 1e8,
-                        "total_sent": data.get("total_sent", 0) / 1e8,
+                        "balance_satoshi": balance_satoshi,
+                        "balance_btc": balance_satoshi / 1e8,
+                        "total_received": (
+                            data.get("total_received", 0) / 1e8
+                        ),
+                        "total_sent": (
+                            data.get("total_sent", 0) / 1e8
+                        ),
                         "tx_count": data.get("n_tx", 0),
-                        "first_tx": data.get("txs", [{}])[-1].get("time", "") if data.get("txs") else "",
-                        "last_tx": data.get("txs", [{}])[0].get("time", "") if data.get("txs") else "",
-                    }
-                ))
-        except Exception:
-            pass
-        return out
+                        "first_tx": (
+                            transactions[-1].get("time", "")
+                            if transactions
+                            else ""
+                        ),
+                        "last_tx": (
+                            transactions[0].get("time", "")
+                            if transactions
+                            else ""
+                        ),
+                    },
+                )
+            ]
 
-    def _bitcoin_abuse(self, address, iid, aid):
-        """BitcoinAbuse — check if address is reported for scams/ransomware"""
-        out = []
+        except Exception:
+            return []
+
+    def _bitcoin_abuse(
+        self,
+        address,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
-            r = requests.get(
-                f"https://www.bitcoinabuse.com/api/reports/check",
-                params={"address": address, "api_token": os.getenv("BITCOIN_ABUSE_KEY", "")},
-                timeout=10
+            response = requests.get(
+                "https://www.bitcoinabuse.com/api/reports/check",
+                params={
+                    "address": address,
+                    "api_token": os.getenv(
+                        "BITCOIN_ABUSE_KEY",
+                        "",
+                    ),
+                },
+                timeout=10,
             )
-            if r.status_code == 200:
-                data = r.json()
-                count = data.get("count", 0)
-                if count > 0:
-                    out.append(Finding(
-                        investigation_id=iid, actor_id=aid,
-                        finding_type="crypto", value=address,
-                        source="bitcoin_abuse",
-                        source_url=f"https://www.bitcoinabuse.com/reports/{address}",
-                        confidence=0.90,
-                        evidence=[Evidence(
-                            source="bitcoin_abuse",
-                            title=f"Reported abuse: {address[:20]}...",
-                            excerpt=f"Reports: {count} | Types: {data.get('recent',{})}"
-                        )],
-                        metadata={"abuse_count": count, "recent": data.get("recent", {})}
-                    ))
-        except Exception:
-            pass
-        return out
 
-    def _etherscan(self, address, iid, aid):
-        out = []
-        key = os.getenv("ETHERSCAN_API_KEY", "")
-        if not key:
-            return out
+            if response.status_code != 200:
+                return []
+
+            data = response.json()
+            count = data.get("count", 0)
+
+            if count <= 0:
+                return []
+
+            return [
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type="crypto",
+                    value=address,
+                    source="bitcoin_abuse",
+                    source_url=(
+                        f"https://www.bitcoinabuse.com/reports/"
+                        f"{address}"
+                    ),
+                    confidence=0.90,
+                    evidence=[
+                        Evidence(
+                            source="bitcoin_abuse",
+                            source_url=(
+                                f"https://www.bitcoinabuse.com/reports/"
+                                f"{address}"
+                            ),
+                            title=(
+                                f"Reported abuse: "
+                                f"{address[:20]}..."
+                            ),
+                            excerpt=(
+                                f"Reports: {count} | "
+                                f"Types: {data.get('recent', {})}"
+                            ),
+                        )
+                    ],
+                    metadata={
+                        "abuse_count": count,
+                        "recent": data.get("recent", {}),
+                    },
+                )
+            ]
+
+        except Exception:
+            return []
+
+    def _etherscan(
+        self,
+        address,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
+        api_key = os.getenv(
+            "ETHERSCAN_API_KEY",
+            "",
+        )
+
+        if not api_key:
+            return []
+
         try:
-            r = requests.get(
+            response = requests.get(
                 "https://api.etherscan.io/api",
                 params={
-                    "module": "account", "action": "balance",
-                    "address": address, "tag": "latest", "apikey": key
-                }, timeout=10
+                    "module": "account",
+                    "action": "balance",
+                    "address": address,
+                    "tag": "latest",
+                    "apikey": api_key,
+                },
+                timeout=10,
             )
-            if r.status_code == 200 and r.json().get("status") == "1":
-                balance_wei = int(r.json().get("result", 0))
-                balance_eth = balance_wei / 1e18
 
-                # Get transaction count
-                txn_r = requests.get(
-                    "https://api.etherscan.io/api",
-                    params={
-                        "module": "account", "action": "txlist",
-                        "address": address, "startblock": 0,
-                        "endblock": 99999999, "page": 1,
-                        "offset": 5, "sort": "desc", "apikey": key
-                    }, timeout=10
+            if response.status_code != 200:
+                return []
+
+            payload = response.json()
+
+            if payload.get("status") != "1":
+                return []
+
+            balance_wei = int(
+                payload.get("result", 0)
+            )
+            balance_eth = balance_wei / 1e18
+
+            transaction_response = requests.get(
+                "https://api.etherscan.io/api",
+                params={
+                    "module": "account",
+                    "action": "txlist",
+                    "address": address,
+                    "startblock": 0,
+                    "endblock": 99999999,
+                    "page": 1,
+                    "offset": 5,
+                    "sort": "desc",
+                    "apikey": api_key,
+                },
+                timeout=10,
+            )
+
+            transactions = []
+
+            if transaction_response.status_code == 200:
+                transactions = (
+                    transaction_response
+                    .json()
+                    .get("result", [])
                 )
-                txns = txn_r.json().get("result", []) if txn_r.status_code == 200 else []
 
-                out.append(Finding(
-                    investigation_id=iid, actor_id=aid,
-                    finding_type="crypto", value=address,
+            return [
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type="crypto",
+                    value=address,
                     source="etherscan",
-                    source_url=f"https://etherscan.io/address/{address}",
+                    source_url=(
+                        f"https://etherscan.io/address/{address}"
+                    ),
                     confidence=0.95,
-                    evidence=[Evidence(
-                        source="etherscan",
-                        title=f"Ethereum wallet: {address[:20]}...",
-                        excerpt=f"Balance: {balance_eth:.6f} ETH | Txns: {len(txns)}"
-                    )],
+                    evidence=[
+                        Evidence(
+                            source="etherscan",
+                            source_url=(
+                                f"https://etherscan.io/address/"
+                                f"{address}"
+                            ),
+                            title=(
+                                f"Ethereum wallet: "
+                                f"{address[:20]}..."
+                            ),
+                            excerpt=(
+                                f"Balance: {balance_eth:.6f} ETH | "
+                                f"Recent txns: {len(transactions)}"
+                            ),
+                        )
+                    ],
                     metadata={
                         "wallet_type": "ethereum",
                         "balance_wei": balance_wei,
                         "balance_eth": balance_eth,
-                        "recent_tx_count": len(txns)
-                    }
-                ))
-        except Exception:
-            pass
-        return out
+                        "recent_tx_count": len(transactions),
+                    },
+                )
+            ]
 
-    def _xmrchain(self, address, iid, aid):
-        """Monero — limited info due to privacy design"""
-        out = []
-        try:
-            out.append(Finding(
-                investigation_id=iid, actor_id=aid,
-                finding_type="crypto", value=address,
-                source="manual_note", confidence=0.50,
-                evidence=[Evidence(
-                    source="xmrchain",
-                    title="Monero address detected",
-                    excerpt="Monero transactions are private by design — limited blockchain analysis possible"
-                )],
-                metadata={"wallet_type": "monero", "privacy": "high"}
-            ))
         except Exception:
-            pass
-        return out
+            return []
 
-    def _blockchair(self, address, wallet_type, iid, aid):
-        """Blockchair — multi-chain explorer, free tier"""
-        out = []
-        chain_map = {
-            "bitcoin": "bitcoin", "bitcoin_bech32": "bitcoin",
-            "ethereum": "ethereum", "litecoin": "litecoin"
-        }
-        chain = chain_map.get(wallet_type, "bitcoin")
-        try:
-            r = requests.get(
-                f"https://api.blockchair.com/{chain}/dashboards/address/{address}",
-                timeout=10
+    def _xmrchain(
+        self,
+        address,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
+        return [
+            Finding(
+                investigation_id=investigation_id,
+                actor_id=actor_id,
+                run_id=run_id,
+                finding_type="crypto",
+                value=address,
+                source="xmrchain",
+                source_url=(
+                    f"https://xmrchain.net/search/"
+                    f"{address}"
+                ),
+                confidence=0.50,
+                evidence=[
+                    Evidence(
+                        source="xmrchain",
+                        source_url=(
+                            f"https://xmrchain.net/search/"
+                            f"{address}"
+                        ),
+                        title="Monero address detected",
+                        excerpt=(
+                            "Monero transactions provide limited "
+                            "public blockchain attribution data."
+                        ),
+                    )
+                ],
+                metadata={
+                    "wallet_type": "monero",
+                    "privacy": "high",
+                },
             )
-            if r.status_code == 200:
-                data = r.json().get("data", {}).get(address, {})
-                addr_data = data.get("address", {})
-                out.append(Finding(
-                    investigation_id=iid, actor_id=aid,
-                    finding_type="crypto", value=address,
+        ]
+
+    def _blockchair(
+        self,
+        address,
+        wallet_type,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
+        chain_map = {
+            "bitcoin": "bitcoin",
+            "bitcoin_bech32": "bitcoin",
+            "ethereum": "ethereum",
+            "litecoin": "litecoin",
+        }
+
+        chain = chain_map.get(wallet_type)
+
+        if not chain:
+            return []
+
+        try:
+            response = requests.get(
+                (
+                    f"https://api.blockchair.com/{chain}/"
+                    f"dashboards/address/{address}"
+                ),
+                timeout=10,
+            )
+
+            if response.status_code != 200:
+                return []
+
+            data = (
+                response.json()
+                .get("data", {})
+                .get(address, {})
+            )
+
+            address_data = data.get(
+                "address",
+                {},
+            )
+
+            balance = address_data.get(
+                "balance",
+                0,
+            )
+
+            transaction_count = address_data.get(
+                "transaction_count",
+                0,
+            )
+
+            return [
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type="crypto",
+                    value=address,
                     source="blockchair",
-                    source_url=f"https://blockchair.com/{chain}/address/{address}",
+                    source_url=(
+                        f"https://blockchair.com/{chain}/address/"
+                        f"{address}"
+                    ),
                     confidence=0.85,
-                    evidence=[Evidence(
-                        source="blockchair",
-                        title=f"Blockchair: {chain} {address[:20]}...",
-                        excerpt=f"Balance: {addr_data.get('balance',0)} | Txns: {addr_data.get('transaction_count',0)}"
-                    )],
+                    evidence=[
+                        Evidence(
+                            source="blockchair",
+                            source_url=(
+                                f"https://blockchair.com/{chain}/"
+                                f"address/{address}"
+                            ),
+                            title=(
+                                f"Blockchair: {chain} "
+                                f"{address[:20]}..."
+                            ),
+                            excerpt=(
+                                f"Balance: {balance} | "
+                                f"Txns: {transaction_count}"
+                            ),
+                        )
+                    ],
                     metadata={
                         "chain": chain,
-                        "balance": addr_data.get("balance", 0),
-                        "tx_count": addr_data.get("transaction_count", 0),
-                        "first_seen": addr_data.get("first_seen_receiving", ""),
-                        "last_seen": addr_data.get("last_seen_receiving", ""),
-                        "risk_score": data.get("address", {}).get("risk_score", "")
-                    }
-                ))
-        except Exception:
-            pass
-        return out
+                        "balance": balance,
+                        "tx_count": transaction_count,
+                        "first_seen": address_data.get(
+                            "first_seen_receiving",
+                            "",
+                        ),
+                        "last_seen": address_data.get(
+                            "last_seen_receiving",
+                            "",
+                        ),
+                        "risk_score": address_data.get(
+                            "risk_score",
+                            "",
+                        ),
+                    },
+                )
+            ]
 
+        except Exception:
+            return []
