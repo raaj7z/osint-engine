@@ -1,133 +1,391 @@
-# dns.py — DNS, WHOIS, crt.sh scanner (all free, no key)
+from __future__ import annotations
 
-import socket, requests, json
+import socket
+
+import requests
+
 from .base import Scanner
-from ..models import Finding, Evidence
+from ..models import Evidence, Finding
+
 
 class DNSScanner(Scanner):
     name = "dns"
     supported_types = {"domain", "url"}
 
-    def scan(self, identifier, investigation_id, actor_id):
-        host = identifier.value.split("://", 1)[-1].split("/", 1)[0]
+    def scan(
+        self,
+        identifier,
+        investigation_id,
+        actor_id=None,
+        run_id=None,
+    ):
+        host = (
+            identifier.value
+            .split("://", 1)[-1]
+            .split("/", 1)[0]
+            .split("?", 1)[0]
+            .split("#", 1)[0]
+        )
+
+        if not host:
+            return []
+
         results = []
-        results += self._resolve(host, investigation_id, actor_id)
-        results += self._whois(host, investigation_id, actor_id)
-        results += self._crtsh(host, investigation_id, actor_id)
-        results += self._wayback(host, investigation_id, actor_id)
+
+        results.extend(
+            self._resolve(
+                host,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
+        )
+
+        results.extend(
+            self._whois(
+                host,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
+        )
+
+        results.extend(
+            self._crtsh(
+                host,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
+        )
+
+        results.extend(
+            self._wayback(
+                host,
+                investigation_id,
+                actor_id,
+                run_id,
+            )
+        )
+
         return results
 
-    def _resolve(self, host, iid, aid):
-        out = []
+    def _resolve(
+        self,
+        host,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
-            ips = sorted({x[4][0] for x in socket.getaddrinfo(host, None)})
-            for ip in ips:
-                out.append(Finding(
-                    investigation_id=iid, actor_id=aid,
-                    finding_type="ip", value=ip,
-                    source="dns_resolve", confidence=0.9,
-                    evidence=[Evidence(source="dns", title=f"A record: {host} → {ip}")],
-                    metadata={"resolved_from": host, "record_type": "A"}
-                ))
+            addresses = sorted(
+                {
+                    item[4][0]
+                    for item in socket.getaddrinfo(
+                        host,
+                        None,
+                    )
+                }
+            )
         except Exception:
-            pass
-        return out
+            return []
 
-    def _whois(self, host, iid, aid):
-        out = []
+        results = []
+
+        for ip in addresses:
+            results.append(
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type="ip",
+                    value=ip,
+                    source="dns_resolve",
+                    source_url=f"dns://{host}",
+                    confidence=0.90,
+                    evidence=[
+                        Evidence(
+                            source="dns",
+                            source_url=f"dns://{host}",
+                            title=(
+                                f"A record: "
+                                f"{host} → {ip}"
+                            ),
+                        )
+                    ],
+                    metadata={
+                        "resolved_from": host,
+                        "record_type": "A",
+                    },
+                )
+            )
+
+        return results
+
+    def _whois(
+        self,
+        host,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
             import whois
-            w = whois.whois(host)
-            out.append(Finding(
-                investigation_id=iid, actor_id=aid,
-                finding_type="domain", value=host,
-                source="whois", confidence=0.85,
-                evidence=[Evidence(
+
+            data = whois.whois(host)
+
+            registrar = str(
+                data.registrar or ""
+            )
+
+            creation_date = str(
+                data.creation_date or ""
+            )
+
+            expiration_date = str(
+                data.expiration_date or ""
+            )
+
+            updated_date = str(
+                data.updated_date or ""
+            )
+
+            country = str(
+                data.country or ""
+            )
+
+            name_servers = [
+                str(value)
+                for value in (
+                    data.name_servers or []
+                )
+            ][:10]
+
+            return [
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type="domain",
+                    value=host,
                     source="whois",
-                    title=f"WHOIS: {host}",
-                    excerpt=f"Registrar: {w.registrar} | Created: {w.creation_date} | Country: {w.country}"
-                )],
-                metadata={
-                    "registrar": str(w.registrar or ""),
-                    "created": str(w.creation_date or ""),
-                    "expires": str(w.expiration_date or ""),
-                    "updated": str(w.updated_date or ""),
-                    "country": str(w.country or ""),
-                    "name_servers": [str(ns) for ns in (w.name_servers or [])][:5]
-                }
-            ))
-        except Exception:
-            pass
-        return out
+                    source_url=f"whois://{host}",
+                    confidence=0.85,
+                    evidence=[
+                        Evidence(
+                            source="whois",
+                            source_url=f"whois://{host}",
+                            title=f"WHOIS: {host}",
+                            excerpt=(
+                                f"Registrar: {registrar} | "
+                                f"Created: {creation_date} | "
+                                f"Country: {country}"
+                            ),
+                        )
+                    ],
+                    metadata={
+                        "registrar": registrar,
+                        "created": creation_date,
+                        "expires": expiration_date,
+                        "updated": updated_date,
+                        "country": country,
+                        "name_servers": name_servers,
+                    },
+                )
+            ]
 
-    def _crtsh(self, host, iid, aid):
-        """crt.sh — Certificate Transparency, completely free
-        Reveals subdomains and alternative names from SSL certs
-        CRITICAL for dark web: reveals clearnet domains linked to onion SSL certs"""
-        out = []
+        except Exception:
+            return []
+
+    def _crtsh(
+        self,
+        host,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
         try:
-            r = requests.get(
+            response = requests.get(
                 "https://crt.sh/",
-                params={"q": f"%.{host}", "output": "json"},
-                timeout=15
+                params={
+                    "q": f"%.{host}",
+                    "output": "json",
+                },
+                timeout=15,
             )
-            if r.status_code == 200:
-                seen = set()
-                for cert in r.json():
-                    name = cert.get("name_value", "").strip()
-                    for san in name.split("\n"):
-                        san = san.strip().lstrip("*.")
-                        if san and san not in seen and host in san:
-                            seen.add(san)
-                            out.append(Finding(
-                                investigation_id=iid, actor_id=aid,
-                                finding_type="domain", value=san,
-                                source="crt.sh", confidence=0.85,
-                                source_url=f"https://crt.sh/?q={san}",
-                                evidence=[Evidence(
-                                    source="crt.sh",
-                                    title=f"SSL cert SAN: {san}",
-                                    excerpt=f"Issuer: {cert.get('issuer_name','')} | Date: {cert.get('not_before','')}"
-                                )],
-                                metadata={
-                                    "cert_id": cert.get("id", ""),
-                                    "issuer": cert.get("issuer_name", ""),
-                                    "not_before": cert.get("not_before", ""),
-                                    "not_after": cert.get("not_after", "")
-                                }
-                            ))
-        except Exception:
-            pass
-        return out
 
-    def _wayback(self, host, iid, aid):
-        """Wayback Machine — historical presence check"""
-        out = []
-        try:
-            r = requests.get(
-                "https://archive.org/wayback/available",
-                params={"url": host}, timeout=10
-            )
-            if r.status_code == 200:
-                snap = r.json().get("archived_snapshots", {}).get("closest", {})
-                if snap.get("available"):
-                    out.append(Finding(
-                        investigation_id=iid, actor_id=aid,
-                        finding_type="url", value=host,
-                        source="wayback_machine",
-                        source_url=snap.get("url", ""),
-                        confidence=0.70,
-                        evidence=[Evidence(
-                            source="wayback_machine",
-                            title=f"Archived: {host}",
-                            excerpt=f"Timestamp: {snap.get('timestamp','')} | Status: {snap.get('status','')}"
-                        )],
-                        metadata={
-                            "archived_url": snap.get("url", ""),
-                            "timestamp": snap.get("timestamp", ""),
-                            "status": snap.get("status", "")
-                        }
-                    ))
+            if response.status_code != 200:
+                return []
+
+            certificates = response.json()
         except Exception:
-            pass
-        return out
+            return []
+
+        results = []
+        seen = set()
+
+        for certificate in certificates:
+            names = str(
+                certificate.get(
+                    "name_value",
+                    "",
+                )
+            ).splitlines()
+
+            for name in names:
+                name = (
+                    name
+                    .strip()
+                    .lower()
+                    .lstrip("*.")
+                    .rstrip(".")
+                )
+
+                if not name:
+                    continue
+
+                if name in seen:
+                    continue
+
+                if not (
+                    name == host
+                    or name.endswith(
+                        f".{host}"
+                    )
+                ):
+                    continue
+
+                seen.add(name)
+
+                results.append(
+                    Finding(
+                        investigation_id=investigation_id,
+                        actor_id=actor_id,
+                        run_id=run_id,
+                        finding_type="domain",
+                        value=name,
+                        source="crt.sh",
+                        source_url=(
+                            f"https://crt.sh/?q={name}"
+                        ),
+                        confidence=0.85,
+                        evidence=[
+                            Evidence(
+                                source="crt.sh",
+                                source_url=(
+                                    f"https://crt.sh/?q={name}"
+                                ),
+                                title=(
+                                    f"SSL certificate SAN: "
+                                    f"{name}"
+                                ),
+                                excerpt=(
+                                    f"Issuer: "
+                                    f"{certificate.get('issuer_name', '')} | "
+                                    f"Valid from: "
+                                    f"{certificate.get('not_before', '')}"
+                                ),
+                            )
+                        ],
+                        metadata={
+                            "cert_id": certificate.get(
+                                "id",
+                                "",
+                            ),
+                            "issuer": certificate.get(
+                                "issuer_name",
+                                "",
+                            ),
+                            "not_before": certificate.get(
+                                "not_before",
+                                "",
+                            ),
+                            "not_after": certificate.get(
+                                "not_after",
+                                "",
+                            ),
+                        },
+                    )
+                )
+
+        return results
+
+    def _wayback(
+        self,
+        host,
+        investigation_id,
+        actor_id,
+        run_id,
+    ):
+        try:
+            response = requests.get(
+                "https://archive.org/wayback/available",
+                params={
+                    "url": host,
+                },
+                timeout=10,
+            )
+
+            if response.status_code != 200:
+                return []
+
+            snapshot = (
+                response
+                .json()
+                .get(
+                    "archived_snapshots",
+                    {},
+                )
+                .get(
+                    "closest",
+                    {},
+                )
+            )
+
+        except Exception:
+            return []
+
+        if not snapshot.get("available"):
+            return []
+
+        archived_url = snapshot.get(
+            "url",
+            "",
+        )
+
+        return [
+            Finding(
+                investigation_id=investigation_id,
+                actor_id=actor_id,
+                run_id=run_id,
+                finding_type="url",
+                value=host,
+                source="wayback_machine",
+                source_url=archived_url,
+                confidence=0.70,
+                evidence=[
+                    Evidence(
+                        source="wayback_machine",
+                        source_url=archived_url,
+                        title=f"Archived: {host}",
+                        excerpt=(
+                            f"Timestamp: "
+                            f"{snapshot.get('timestamp', '')} | "
+                            f"Status: "
+                            f"{snapshot.get('status', '')}"
+                        ),
+                    )
+                ],
+                metadata={
+                    "archived_url": archived_url,
+                    "timestamp": snapshot.get(
+                        "timestamp",
+                        "",
+                    ),
+                    "status": snapshot.get(
+                        "status",
+                        "",
+                    ),
+                },
+            )
+        ]
