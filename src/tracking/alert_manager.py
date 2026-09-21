@@ -1,172 +1,250 @@
-"""Alert management for the tracking subsystem.
+from __future__ import annotations
 
-Persists alerts to SQLite whenever a tracked actor's re-scan surfaces
-a new, noteworthy finding.
-"""
-
-import os
-import sqlite3
-import uuid
 from datetime import datetime, timezone
+from typing import Any
 
-from ..models import Finding
 
-try:
-    from colorama import Fore, Style, init as colorama_init
-
-    colorama_init(autoreset=True)
-    _COLOR = True
-except ImportError:  # pragma: no cover - optional dependency
-    _COLOR = False
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class AlertManager:
-    """SQLite-backed manager for tracking alerts."""
+    def __init__(self, db: Any = None):
+        self.db = db
 
-    def __init__(self, db_path: str = "data/alerts.db"):
-        """Open (or create) the alerts database and ensure the table exists."""
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._create_table()
+    def create(
+        self,
+        actor_id: str | None,
+        alert_type: str,
+        message: str,
+        finding_id: str | None = None,
+        confidence: float | None = None,
+        severity: str = "MEDIUM",
+        investigation_id: str | None = None,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
+        if self.db is None:
+            return None
 
-    def _create_table(self) -> None:
-        """Create the alerts table if it doesn't already exist."""
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                alert_id TEXT UNIQUE,
-                actor_id TEXT,
-                handle TEXT,
-                alert_type TEXT,
-                finding_type TEXT,
-                value TEXT,
-                message TEXT,
-                confidence REAL,
-                is_read INTEGER DEFAULT 0,
-                created_at TEXT
-            )
-            """
-        )
-        self.conn.commit()
-
-    def _determine_alert_type(self, finding: Finding) -> str:
-        """Classify a finding into an alert type based on its type/source/metadata."""
-        if finding.finding_type in ("username", "forum_profile"):
-            return "NEW_PLATFORM"
-        if finding.finding_type == "crypto":
-            return "NEW_WALLET"
-        if "breach" in finding.source.lower() or "xposedornot" in finding.source.lower():
-            return "BREACH_FOUND"
-        if finding.metadata.get("is_tor_exit"):
-            return "TOR_EXIT"
-        if (finding.metadata.get("abuseConfidenceScore") or 0) > 50:
-            return "HIGH_ABUSE"
-        return "NEW_FINDING"
-
-    def create_alert(self, actor_id: str, handle: str, finding: Finding) -> str:
-        """Create, persist, and print an alert for a newly discovered finding."""
-        alert_id = f"ALT-{uuid.uuid4().hex[:6].upper()}"
-        alert_type = self._determine_alert_type(finding)
-        message = f"[{alert_type}] {handle}: {finding.value} found on {finding.source}"
+        payload = {
+            "severity": severity,
+            "investigation_id": investigation_id,
+            "run_id": run_id,
+            "metadata": metadata or {},
+        }
 
         try:
-            self.conn.execute(
-                """
-                INSERT INTO alerts
-                (alert_id, actor_id, handle, alert_type, finding_type, value,
-                 message, confidence, is_read, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-                """,
-                (
-                    alert_id,
-                    actor_id,
-                    handle,
-                    alert_type,
-                    finding.finding_type,
-                    finding.value,
-                    message,
-                    finding.confidence,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
+            alert_id = self.db.add_alert(
+                actor_id=actor_id,
+                finding_id=finding_id,
+                alert_type=alert_type,
+                message=message,
+                confidence=confidence,
             )
-            self.conn.commit()
         except Exception:
-            self.conn.rollback()
+            return None
 
-        self._print_alert(alert_type, message)
+        if investigation_id:
+            try:
+                self.db.add_timeline_event(
+                    investigation_id=investigation_id,
+                    event_type="alert_created",
+                    message=message,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    payload={
+                        "alert_id": alert_id,
+                        "alert_type": alert_type,
+                        **payload,
+                    },
+                )
+            except Exception:
+                pass
+
         return alert_id
 
-    def _print_alert(self, alert_type: str, message: str) -> None:
-        """Print a colorized alert line to the terminal (falls back to plain text)."""
-        if _COLOR:
-            color = (
-                Fore.RED
-                if alert_type in ("TOR_EXIT", "HIGH_ABUSE", "BREACH_FOUND")
-                else Fore.YELLOW
-            )
-            print(f"{color}{message}{Style.RESET_ALL}")
-        else:
-            print(message)
+    def create_from_event(
+        self,
+        event: dict[str, Any],
+        actor_id: str | None = None,
+        investigation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> str | None:
+        finding = event.get("finding") or {}
 
-    def get_unread(self) -> list[dict]:
-        """Return all unread alerts, most recent first."""
+        confidence = finding.get("confidence")
+
         try:
-            rows = self.conn.execute(
-                "SELECT * FROM alerts WHERE is_read=0 ORDER BY created_at DESC"
-            ).fetchall()
-        except Exception:
-            return []
-        return [dict(r) for r in rows]
+            confidence = (
+                float(confidence)
+                if confidence is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            confidence = None
 
-    def get_all(self, actor_id: str | None = None, limit: int = 50) -> list[dict]:
-        """Return alerts, optionally filtered to a single actor, most recent first."""
+        return self.create(
+            actor_id=actor_id,
+            alert_type=str(
+                event.get(
+                    "event_type",
+                    "monitoring_alert",
+                )
+            ),
+            message=str(
+                event.get(
+                    "message",
+                    "Monitoring event detected",
+                )
+            ),
+            finding_id=finding.get("finding_id"),
+            confidence=confidence,
+            severity=str(
+                event.get(
+                    "severity",
+                    "MEDIUM",
+                )
+            ),
+            investigation_id=investigation_id,
+            run_id=run_id,
+            metadata={
+                "finding": finding,
+                "before": event.get("before"),
+            },
+        )
+
+    def create_from_changes(
+        self,
+        changes: dict[str, Any],
+        actor_id: str | None = None,
+        investigation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> list[str]:
+        from .change_detector import build_change_events
+
+        alert_ids: list[str] = []
+
+        for event in build_change_events(changes):
+            alert_id = self.create_from_event(
+                event,
+                actor_id=actor_id,
+                investigation_id=investigation_id,
+                run_id=run_id,
+            )
+
+            if alert_id:
+                alert_ids.append(alert_id)
+
+        return alert_ids
+
+    def create_monitoring_error(
+        self,
+        actor_id: str | None,
+        message: str,
+        investigation_id: str | None = None,
+        run_id: str | None = None,
+    ) -> str | None:
+        return self.create(
+            actor_id=actor_id,
+            alert_type="monitoring_error",
+            message=message,
+            severity="HIGH",
+            investigation_id=investigation_id,
+            run_id=run_id,
+        )
+
+    def list(
+        self,
+        actor_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.db is None:
+            return []
+
         try:
             if actor_id:
-                rows = self.conn.execute(
-                    "SELECT * FROM alerts WHERE actor_id=? ORDER BY created_at DESC LIMIT ?",
-                    (actor_id, limit),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    "SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
+                return self.db.list_alerts(
+                    actor_id=actor_id,
+                )
+
+            return self.db.list_alerts()
         except Exception:
             return []
-        return [dict(r) for r in rows]
 
-    def mark_read(self, alert_id: str) -> None:
-        """Mark a single alert as read."""
+    def acknowledge(
+        self,
+        alert_id: str,
+    ) -> bool:
+        if self.db is None:
+            return False
+
         try:
-            self.conn.execute(
-                "UPDATE alerts SET is_read=1 WHERE alert_id=?", (alert_id,)
+            self.db.execute(
+                """
+                UPDATE sih_alerts
+                SET acknowledged = 1,
+                    acknowledged_at = ?
+                WHERE alert_id = ?
+                """,
+                (
+                    utc_now(),
+                    alert_id,
+                ),
             )
-            self.conn.commit()
+            return True
         except Exception:
-            self.conn.rollback()
+            try:
+                self.db.conn.rollback()
+            except Exception:
+                pass
+            return False
 
-    def mark_all_read(self) -> None:
-        """Mark all unread alerts as read."""
+    def unacknowledge(
+        self,
+        alert_id: str,
+    ) -> bool:
+        if self.db is None:
+            return False
+
         try:
-            self.conn.execute("UPDATE alerts SET is_read=1 WHERE is_read=0")
-            self.conn.commit()
+            self.db.execute(
+                """
+                UPDATE sih_alerts
+                SET acknowledged = 0,
+                    acknowledged_at = NULL
+                WHERE alert_id = ?
+                """,
+                (alert_id,),
+            )
+            return True
         except Exception:
-            self.conn.rollback()
+            try:
+                self.db.conn.rollback()
+            except Exception:
+                pass
+            return False
 
-    def get_stats(self) -> dict:
-        """Return total/unread counts and a breakdown of alerts by type."""
-        try:
-            total = self.conn.execute("SELECT COUNT(*) c FROM alerts").fetchone()["c"]
-            unread = self.conn.execute(
-                "SELECT COUNT(*) c FROM alerts WHERE is_read=0"
-            ).fetchone()["c"]
-            rows = self.conn.execute(
-                "SELECT alert_type, COUNT(*) c FROM alerts GROUP BY alert_type"
-            ).fetchall()
-            by_type = {r["alert_type"]: r["c"] for r in rows}
-        except Exception:
-            return {"total": 0, "unread": 0, "by_type": {}}
+    def unread(
+        self,
+        actor_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        alerts = self.list(actor_id)
 
-        return {"total": total, "unread": unread, "by_type": by_type}
+        return [
+            alert
+            for alert in alerts
+            if not alert.get("acknowledged")
+        ]
+
+    def count_unread(
+        self,
+        actor_id: str | None = None,
+    ) -> int:
+        return len(
+            self.unread(actor_id)
+        )
+
+
+__all__ = [
+    "AlertManager",
+]
