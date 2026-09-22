@@ -11,11 +11,8 @@ from .models import Finding, Identifier, InvestigationInput, InvestigationResult
 from .normalizer import Normalizer
 from .providers.base import Provider
 from .scanners.base import Scanner
+from .tracking import TrackingManager
 
-
-# ---------------------------------------------------------------------------
-# Component registry
-# ---------------------------------------------------------------------------
 
 _SCANNER_IMPORTS = [
     (".scanners.username", "UsernameScanner"),
@@ -36,11 +33,6 @@ _PROVIDER_IMPORTS = [
     (".providers.censys", "CensysProvider"),
 ]
 
-
-# ---------------------------------------------------------------------------
-# Truthful execution states used by PRALAYX terminal/UI
-# ---------------------------------------------------------------------------
-
 STATUS_RUNNING = "RUNNING"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_NO_RESULTS = "NO_RESULTS"
@@ -55,30 +47,17 @@ def _utc_now() -> datetime:
 
 
 def _try_load(module_path: str, class_name: str):
-    """
-    Import a component dynamically.
-
-    A missing optional scanner/provider must not stop the complete OSINT
-    engine from starting.
-    """
     try:
         module = importlib.import_module(
             module_path,
             package=__package__,
         )
         return getattr(module, class_name)
-
     except Exception:
         return None
 
 
 def _serialize(value: Any) -> Any:
-    """
-    Convert Pydantic/dataclass/native objects into JSON-friendly structures.
-
-    This is intentionally lightweight so the engine does not depend on
-    a particular report serializer.
-    """
     if value is None:
         return None
 
@@ -103,7 +82,6 @@ def _serialize(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_serialize(item) for item in value]
 
-    # Pydantic v2
     model_dump = getattr(value, "model_dump", None)
 
     if callable(model_dump):
@@ -112,7 +90,6 @@ def _serialize(value: Any) -> Any:
         except Exception:
             pass
 
-    # Pydantic v1 compatibility
     model_dict = getattr(value, "dict", None)
 
     if callable(model_dict):
@@ -161,65 +138,36 @@ def _result_status(
     return STATUS_NO_RESULTS
 
 
-# ---------------------------------------------------------------------------
-# OSINT Engine
-# ---------------------------------------------------------------------------
-
 class OSINTEngine:
-    """
-    Master controller for PRALAYX OSINT execution.
-
-    Responsibilities:
-
-    - normalize investigation input
-    - load available scanners/providers
-    - execute applicable components
-    - expose truthful component execution status
-    - isolate provider/scanner failures
-    - emit terminal/event information
-    - deduplicate findings
-    - preserve investigation/run context
-    - optionally persist the final result through a DB adapter
-    """
-
     def __init__(
         self,
         db: Any = None,
         event_sink: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.normalizer = Normalizer()
-
-        # Optional database adapter.
-        #
-        # PRALAYX platform owns the main investigation DB. The OSINT engine
-        # therefore does not assume a particular DB implementation.
         self.db = db
-
-        # Optional callback used by platform/engine_runner.py to stream
-        # execution events into the PRALAYX terminal.
         self.event_sink = event_sink
 
         self.scanners: list[Scanner] = []
         self.providers: list[Provider] = []
 
         self.load_errors: list[str] = []
-
-        # Complete execution event history for this engine instance.
         self.execution_log: list[dict[str, Any]] = []
+
+        self._previous_actor_findings: dict[
+            str,
+            list[Finding],
+        ] = {}
+
+        self.tracking = TrackingManager(
+            db=db,
+            scan_callback=self._scheduled_tracking_scan,
+        )
 
         self._load_scanners()
         self._load_providers()
 
-    # ------------------------------------------------------------------
-    # Event handling
-    # ------------------------------------------------------------------
-
     def _emit(self, event: dict[str, Any]) -> None:
-        """
-        Store an execution event and optionally forward it to PRALAYX.
-
-        The callback must never be allowed to break the actual OSINT run.
-        """
         event = {
             "created_at": _utc_now().isoformat(),
             **event,
@@ -231,22 +179,10 @@ class OSINTEngine:
             try:
                 self.event_sink(event)
             except Exception:
-                # Event delivery failure must never stop OSINT.
                 pass
 
-    # ------------------------------------------------------------------
-    # Component loading
-    # ------------------------------------------------------------------
-
     def _load_scanners(self) -> None:
-        """
-        Load all scanner classes that are available.
-
-        A missing optional scanner is recorded instead of crashing the
-        complete engine.
-        """
         for module_path, class_name in _SCANNER_IMPORTS:
-
             cls = _try_load(
                 module_path,
                 class_name,
@@ -294,14 +230,7 @@ class OSINTEngine:
                 )
 
     def _load_providers(self) -> None:
-        """
-        Load all external providers that are available.
-
-        Provider configuration is checked at execution time when the provider
-        exposes an is_configured() method.
-        """
         for module_path, class_name in _PROVIDER_IMPORTS:
-
             cls = _try_load(
                 module_path,
                 class_name,
@@ -348,16 +277,7 @@ class OSINTEngine:
                     }
                 )
 
-    # ------------------------------------------------------------------
-    # Component registry
-    # ------------------------------------------------------------------
-
     def component_status(self) -> list[dict[str, Any]]:
-        """
-        Return a machine-readable registry of loaded components.
-
-        Used by PRALAYX to populate the OSINT status/terminal UI.
-        """
         components: list[dict[str, Any]] = []
 
         for component in [
@@ -392,21 +312,11 @@ class OSINTEngine:
 
         return components
 
-    # ------------------------------------------------------------------
-    # Identifier support
-    # ------------------------------------------------------------------
-
     def _supports(
         self,
         component: Any,
         identifier: Identifier,
     ) -> bool:
-        """
-        Safely check whether a component supports an identifier.
-
-        A broken supports() implementation is treated as a component error,
-        not as an investigation-wide failure.
-        """
         try:
             return bool(
                 component.supports(identifier)
@@ -422,25 +332,10 @@ class OSINTEngine:
 
             return False
 
-    # ------------------------------------------------------------------
-    # Configuration detection
-    # ------------------------------------------------------------------
-
     def _check_configuration(
         self,
         component: Any,
     ) -> tuple[bool | None, str | None]:
-        """
-        Check provider/scanner configuration when the component exposes
-        is_configured().
-
-        Returns:
-            (True, None)   -> configured
-            (False, reason) -> missing configuration
-            (None, reason) -> configuration check itself failed
-
-        Components without is_configured() are treated as configured.
-        """
         checker = getattr(
             component,
             "is_configured",
@@ -458,6 +353,21 @@ class OSINTEngine:
             if configured:
                 return True, None
 
+            reason_method = getattr(
+                component,
+                "configuration_reason",
+                None,
+            )
+
+            if callable(reason_method):
+                try:
+                    reason = reason_method()
+                except Exception:
+                    reason = None
+
+                if reason:
+                    return False, str(reason)
+
             return (
                 False,
                 "required configuration is not available",
@@ -469,22 +379,12 @@ class OSINTEngine:
                 f"configuration check failed: {exc}",
             )
 
-    # ------------------------------------------------------------------
-    # Component execution
-    # ------------------------------------------------------------------
-
     def _run_component(
         self,
         component: Any,
         identifier: Identifier,
         investigation: InvestigationInput,
     ) -> tuple[list[Finding], dict[str, Any]]:
-        """
-        Execute exactly one scanner/provider.
-
-        This method is deliberately isolated so a provider failure cannot
-        terminate the entire investigation.
-        """
         name = _component_name(component)
         kind = _component_kind(component)
 
@@ -493,9 +393,11 @@ class OSINTEngine:
             "kind": kind,
             "identifier_type": identifier.type,
             "identifier": identifier.value,
+            "run_id": investigation.run_id,
+            "investigation_id": investigation.investigation_id,
+            "actor_id": investigation.actor_id,
         }
 
-        # Unsupported identifier type.
         if not self._supports(
             component,
             identifier,
@@ -511,7 +413,6 @@ class OSINTEngine:
 
             return [], event
 
-        # Configuration check.
         configured, configuration_reason = (
             self._check_configuration(component)
         )
@@ -540,7 +441,6 @@ class OSINTEngine:
 
             return [], event
 
-        # Start event.
         started_at = _utc_now()
 
         self._emit(
@@ -557,6 +457,7 @@ class OSINTEngine:
                     identifier,
                     investigation.investigation_id,
                     investigation.actor_id,
+                    investigation.run_id,
                 )
 
             else:
@@ -564,6 +465,7 @@ class OSINTEngine:
                     identifier,
                     investigation.investigation_id,
                     investigation.actor_id,
+                    investigation.run_id,
                 )
 
             findings = list(
@@ -621,25 +523,14 @@ class OSINTEngine:
 
             return [], event
 
-    # ------------------------------------------------------------------
-    # Finding normalization
-    # ------------------------------------------------------------------
-
     def _normalize_findings(
         self,
         findings: list[Finding],
         investigation: InvestigationInput,
     ) -> list[Finding]:
-        """
-        Ensure findings returned by individual components carry the current
-        investigation/actor context.
-
-        Existing source/evidence/metadata are preserved.
-        """
         normalized: list[Finding] = []
 
         for finding in findings:
-
             try:
                 if not finding.investigation_id:
                     finding.investigation_id = (
@@ -654,54 +545,33 @@ class OSINTEngine:
                         investigation.actor_id
                     )
 
+                if (
+                    finding.run_id is None
+                    and investigation.run_id is not None
+                ):
+                    finding.run_id = (
+                        investigation.run_id
+                    )
+
                 normalized.append(finding)
 
             except Exception:
-                # Do not lose a valid finding merely because its model is
-                # unexpectedly immutable/custom.
                 normalized.append(finding)
 
         return normalized
-
-    # ------------------------------------------------------------------
-    # Main execution
-    # ------------------------------------------------------------------
 
     def run(
         self,
         investigation: InvestigationInput,
     ) -> InvestigationResult:
-        """
-        Execute a complete OSINT investigation.
-
-        Flow:
-
-            input
-              ↓
-            normalization
-              ↓
-            scanners/providers
-              ↓
-            truthful execution events
-              ↓
-            finding normalization
-              ↓
-            deduplication
-              ↓
-            InvestigationResult
-        """
         started_at = _utc_now()
 
-        # Reset execution history for this run.
         self.execution_log = []
 
         errors: list[str] = []
 
-        # Load errors are warnings/errors associated with unavailable
-        # components. They do not prevent available components from running.
         errors.extend(self.load_errors)
 
-        # Normalize the incoming investigation before dispatch.
         investigation = (
             self.normalizer
             .normalize_investigation_input(
@@ -715,6 +585,7 @@ class OSINTEngine:
                 "status": STATUS_RUNNING,
                 "investigation_id": investigation.investigation_id,
                 "actor_id": investigation.actor_id,
+                "run_id": investigation.run_id,
                 "identifier_count": len(
                     investigation.identifiers
                 ),
@@ -723,14 +594,8 @@ class OSINTEngine:
 
         all_findings: list[Finding] = []
 
-        # --------------------------------------------------------------
-        # Run all identifiers
-        # --------------------------------------------------------------
-
         for identifier in investigation.identifiers:
-
             for scanner in self.scanners:
-
                 findings, event = self._run_component(
                     scanner,
                     identifier,
@@ -750,7 +615,6 @@ class OSINTEngine:
                     )
 
             for provider in self.providers:
-
                 findings, event = self._run_component(
                     provider,
                     identifier,
@@ -769,10 +633,6 @@ class OSINTEngine:
                         f"{event.get('reason', 'unknown error')}"
                     )
 
-        # --------------------------------------------------------------
-        # Normalize and deduplicate
-        # --------------------------------------------------------------
-
         all_findings = self._normalize_findings(
             all_findings,
             investigation,
@@ -783,10 +643,6 @@ class OSINTEngine:
         )
 
         completed_at = _utc_now()
-
-        # --------------------------------------------------------------
-        # Determine overall status
-        # --------------------------------------------------------------
 
         runtime_errors = [
             error
@@ -806,22 +662,99 @@ class OSINTEngine:
         else:
             overall_status = STATUS_NO_RESULTS
 
-        # --------------------------------------------------------------
-        # Build result using the existing Pydantic model
-        # --------------------------------------------------------------
-
         result = InvestigationResult(
             investigation_id=investigation.investigation_id,
             actor_id=investigation.actor_id,
+            session_id=investigation.session_id,
+            run_id=investigation.run_id,
             findings=deduped,
             started_at=started_at,
             completed_at=completed_at,
             errors=errors,
         )
 
-        # --------------------------------------------------------------
-        # Final event
-        # --------------------------------------------------------------
+        tracking_result: dict[str, Any] | None = None
+
+        if (
+            self.tracking is not None
+            and investigation.actor_id
+        ):
+            try:
+                previous_findings = (
+                    self._previous_actor_findings.get(
+                        investigation.actor_id,
+                        [],
+                    )
+                )
+
+                tracking_result = self.tracking.process(
+                    previous_findings=previous_findings,
+                    current_findings=deduped,
+                    actor_id=investigation.actor_id,
+                    investigation_id=investigation.investigation_id,
+                    run_id=investigation.run_id,
+                )
+
+                self._previous_actor_findings[
+                    investigation.actor_id
+                ] = list(deduped)
+
+                self._emit(
+                    {
+                        "event": "tracking_updated",
+                        "status": STATUS_COMPLETED,
+                        "investigation_id": investigation.investigation_id,
+                        "actor_id": investigation.actor_id,
+                        "run_id": investigation.run_id,
+                        "change_summary": tracking_result.get(
+                            "summary"
+                        ),
+                        "alert_ids": tracking_result.get(
+                            "alert_ids",
+                            [],
+                        ),
+                    }
+                )
+
+            except Exception as exc:
+                tracking_result = {
+                    "status": STATUS_ERROR,
+                    "reason": str(exc),
+                }
+
+                self._emit(
+                    {
+                        "event": "tracking_updated",
+                        "status": STATUS_ERROR,
+                        "investigation_id": investigation.investigation_id,
+                        "actor_id": investigation.actor_id,
+                        "run_id": investigation.run_id,
+                        "reason": str(exc),
+                    }
+                )
+
+        result.execution_log = list(
+            self.execution_log
+        )
+
+        result.component_registry = {
+            "scanners": len(self.scanners),
+            "providers": len(self.providers),
+            "components": self.component_status(),
+        }
+
+        result.metadata = {
+            **(
+                getattr(
+                    result,
+                    "metadata",
+                    {},
+                )
+                or {}
+            ),
+            "run_id": investigation.run_id,
+            "tracking": tracking_result,
+        }
 
         self._emit(
             {
@@ -831,16 +764,13 @@ class OSINTEngine:
                     investigation.investigation_id
                 ),
                 "actor_id": investigation.actor_id,
+                "run_id": investigation.run_id,
                 "finding_count": len(deduped),
                 "error_count": len(errors),
                 "started_at": started_at.isoformat(),
                 "completed_at": completed_at.isoformat(),
             }
         )
-
-        # --------------------------------------------------------------
-        # Optional DB persistence
-        # --------------------------------------------------------------
 
         if self.db is not None:
             try:
@@ -849,28 +779,16 @@ class OSINTEngine:
                 )
 
             except Exception as exc:
-                # Database failure must be visible instead of silently
-                # pretending persistence succeeded.
                 result.errors.append(
                     f"database persistence failed: {exc}"
                 )
 
         return result
 
-    # ------------------------------------------------------------------
-    # Dictionary/JSON-friendly execution
-    # ------------------------------------------------------------------
-
     def run_dict(
         self,
         investigation: InvestigationInput,
     ) -> dict[str, Any]:
-        """
-        Run an investigation and return a JSON-friendly structure.
-
-        This is the preferred entry point for platform/engine_runner.py when
-        it needs to send OSINT output to the PRALAYX API.
-        """
         result = self.run(
             investigation
         )
@@ -882,8 +800,6 @@ class OSINTEngine:
                 "result": payload
             }
 
-        # These fields are intentionally outside InvestigationResult because
-        # the existing model should remain backwards compatible.
         execution_status = STATUS_COMPLETED
 
         if not result.findings:
@@ -894,41 +810,33 @@ class OSINTEngine:
             )
 
         payload["status"] = execution_status
-
         payload["execution_log"] = list(
             self.execution_log
         )
-
         payload["component_registry"] = (
             self.component_status()
         )
+        payload["tracking"] = (
+            getattr(
+                result,
+                "metadata",
+                {},
+            )
+            or {}
+        ).get("tracking")
 
         return payload
-
-    # ------------------------------------------------------------------
-    # Deduplication
-    # ------------------------------------------------------------------
 
     def _deduplicate_findings(
         self,
         findings: list[Finding],
     ) -> list[Finding]:
-        """
-        Deduplicate findings using:
-
-            finding_type + value + source
-
-        If multiple records represent the same finding, keep the one with
-        the highest confidence and merge useful evidence/metadata where
-        possible.
-        """
         best: dict[
             tuple[str, str, str],
             Finding,
         ] = {}
 
         for finding in findings:
-
             finding_type = str(
                 finding.finding_type
             ).lower()
@@ -956,7 +864,6 @@ class OSINTEngine:
 
             existing = best[key]
 
-            # Keep highest-confidence finding.
             if (
                 finding.confidence
                 > existing.confidence
@@ -967,7 +874,6 @@ class OSINTEngine:
                 winner = existing
                 loser = finding
 
-            # Merge evidence from the other copy.
             existing_evidence = list(
                 winner.evidence
             )
@@ -980,8 +886,6 @@ class OSINTEngine:
 
             winner.evidence = existing_evidence
 
-            # Merge metadata without overwriting the stronger/current
-            # finding's existing values.
             merged_metadata = dict(
                 loser.metadata
             )
@@ -998,9 +902,166 @@ class OSINTEngine:
             best.values()
         )
 
-    # ------------------------------------------------------------------
-    # CLI
-    # ------------------------------------------------------------------
+    def _scheduled_tracking_scan(
+        self,
+        watch_entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        actor_id = watch_entry.get("actor_id")
+
+        if not actor_id:
+            raise ValueError(
+                "watchlist entry has no actor_id"
+            )
+
+        raw_identifiers = (
+            watch_entry.get("identifiers")
+            or []
+        )
+
+        if (
+            not raw_identifiers
+            and self.db is not None
+        ):
+            for method_name in (
+                "list_actor_identifiers",
+                "get_actor_identifiers",
+                "list_identifiers_for_actor",
+            ):
+                method = getattr(
+                    self.db,
+                    method_name,
+                    None,
+                )
+
+                if not callable(method):
+                    continue
+
+                try:
+                    raw_identifiers = method(
+                        actor_id
+                    )
+                except Exception:
+                    raw_identifiers = []
+
+                if raw_identifiers:
+                    break
+
+        if not raw_identifiers:
+            raise ValueError(
+                f"no identifiers available for "
+                f"tracked actor {actor_id}"
+            )
+
+        identifiers: list[Identifier] = []
+
+        for item in raw_identifiers:
+            if isinstance(
+                item,
+                Identifier,
+            ):
+                identifiers.append(item)
+                continue
+
+            if isinstance(
+                item,
+                str,
+            ):
+                identifiers.append(
+                    Identifier(
+                        type="username",
+                        value=item,
+                        source="watchlist",
+                    )
+                )
+                continue
+
+            if isinstance(
+                item,
+                dict,
+            ):
+                identifiers.append(
+                    Identifier(
+                        **item
+                    )
+                )
+
+        if not identifiers:
+            raise ValueError(
+                f"no valid identifiers available "
+                f"for tracked actor {actor_id}"
+            )
+
+        investigation_id = (
+            watch_entry.get(
+                "investigation_id"
+            )
+            or f"MON-{actor_id}-"
+            f"{int(_utc_now().timestamp())}"
+        )
+
+        investigation = InvestigationInput(
+            investigation_id=investigation_id,
+            actor_id=actor_id,
+            identifiers=identifiers,
+            metadata={
+                "source": "watchlist",
+                "scheduled": True,
+                "watch_id": watch_entry.get(
+                    "watch_id"
+                ),
+            },
+        )
+
+        result = self.run(
+            investigation
+        )
+
+        return _serialize(result)
+
+    def add_to_watchlist(
+        self,
+        actor_id: str,
+        interval_minutes: int = 360,
+    ) -> str:
+        return self.tracking.add_actor(
+            actor_id=actor_id,
+            interval_minutes=interval_minutes,
+        )
+
+    def remove_from_watchlist(
+        self,
+        watch_id: str,
+    ) -> None:
+        self.tracking.remove_actor(
+            watch_id
+        )
+
+    def pause_watch(
+        self,
+        watch_id: str,
+    ) -> None:
+        self.tracking.pause_actor(
+            watch_id
+        )
+
+    def resume_watch(
+        self,
+        watch_id: str,
+    ) -> None:
+        self.tracking.resume_actor(
+            watch_id
+        )
+
+    def start_tracking(self) -> bool:
+        return self.tracking.start()
+
+    def stop_tracking(self) -> bool:
+        return self.tracking.stop()
+
+    def tracking_status(
+        self,
+    ) -> dict[str, Any]:
+        return self.tracking.status()
 
     @staticmethod
     def _build_cli_parser() -> argparse.ArgumentParser:
@@ -1096,10 +1157,15 @@ class OSINTEngine:
             identifiers=identifiers,
         )
 
-        def terminal_event(event: dict[str, Any]) -> None:
+        def terminal_event(
+            event: dict[str, Any],
+        ) -> None:
             component = event.get(
                 "component",
-                event.get("event", "OSINT"),
+                event.get(
+                    "event",
+                    "OSINT",
+                ),
             )
 
             status = event.get(
