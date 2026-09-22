@@ -1,23 +1,15 @@
-"""Dark web scanner for the OSINT engine.
-
-Searches public dark-web indexing services (Ahmia, DarkSearch) for
-mentions of a username, domain, or URL. These are passive, surface-web
-API calls against services that already crawl .onion content — no
-direct Tor connection is required.
-"""
+from __future__ import annotations
 
 import re
 
 import requests
 from bs4 import BeautifulSoup
 
-from ..models import Identifier, Finding
+from ..models import Evidence, Finding, Identifier
 from .base import Scanner
 
 
 class DarkWebScanner(Scanner):
-    """Scanner that queries public dark-web search indexes for an identifier."""
-
     name = "darkweb"
     supported_types = {"username", "domain", "url"}
 
@@ -26,149 +18,338 @@ class DarkWebScanner(Scanner):
         identifier: Identifier,
         investigation_id: str,
         actor_id: str | None = None,
+        run_id: str | None = None,
     ) -> list[Finding]:
-        """Query all dark-web indexes for the identifier and return combined findings."""
-        query = identifier.value
+        query = identifier.value.strip()
+
+        if not query:
+            return []
+
         findings: list[Finding] = []
 
-        for technique in (self._ahmia, self._darksearch):
+        for technique in (
+            self._ahmia,
+            self._darksearch,
+        ):
             try:
-                findings.extend(technique(query, investigation_id, actor_id))
+                findings.extend(
+                    technique(
+                        query,
+                        investigation_id,
+                        actor_id,
+                        run_id,
+                    )
+                )
             except Exception:
                 continue
 
-        return findings
+        return self._deduplicate(findings)
 
-    def _ahmia(self, query: str, iid: str, aid: str | None) -> list[Finding]:
-        """Search Ahmia's public dark-web index and extract .onion result links."""
+    def _ahmia(
+        self,
+        query: str,
+        investigation_id: str,
+        actor_id: str | None,
+        run_id: str | None,
+    ) -> list[Finding]:
         try:
-            resp = requests.get(
+            response = requests.get(
                 "https://ahmia.fi/search/",
                 params={"q": query},
                 timeout=15,
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers={
+                    "User-Agent": (
+                        "PRALAYX-OSINT-Engine/1.0 "
+                        "(SIH26151; passive-index-search)"
+                    )
+                },
             )
-            resp.raise_for_status()
-        except Exception:
+            response.raise_for_status()
+        except requests.RequestException:
             return []
 
         try:
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup = BeautifulSoup(
+                response.text,
+                "html.parser",
+            )
         except Exception:
             return []
 
         findings: list[Finding] = []
-        results = soup.select("li.result") or soup.select(".result")
+
+        results = (
+            soup.select("li.result")
+            or soup.select(".result")
+        )
 
         for result in results:
             link_tag = result.find("a")
+
             if not link_tag:
                 continue
 
-            href = link_tag.get("href", "")
-            onion_match = re.search(r"https?://[a-z2-7]{16,56}\.onion\S*", href)
+            href = str(
+                link_tag.get("href", "")
+            )
+
+            onion_match = re.search(
+                r"https?://[a-z2-7]{16,56}\.onion\S*",
+                href,
+            )
+
             if not onion_match:
-                # Ahmia sometimes wraps a redirect URL containing the real onion link in text.
                 onion_match = re.search(
-                    r"https?://[a-z2-7]{16,56}\.onion\S*", result.get_text()
+                    r"https?://[a-z2-7]{16,56}\.onion\S*",
+                    result.get_text(" ", strip=True),
                 )
+
             if not onion_match:
                 continue
 
             onion_url = onion_match.group(0)
-            title = link_tag.get_text(strip=True) or None
-            excerpt_tag = result.find("p")
-            excerpt = excerpt_tag.get_text(strip=True) if excerpt_tag else None
 
-            context = self._extract_onion_context(
-                f"{title or ''} {excerpt or ''}", query
+            title = (
+                link_tag.get_text(
+                    " ",
+                    strip=True,
+                )
+                or None
             )
 
-            finding_type = "forum_profile" if context["found"] else "url"
+            excerpt_tag = result.find("p")
 
-            finding = Finding(
-                investigation_id=iid,
-                actor_id=aid,
-                finding_type=finding_type,
-                value=onion_url,
+            excerpt = (
+                excerpt_tag.get_text(
+                    " ",
+                    strip=True,
+                )
+                if excerpt_tag
+                else None
+            )
+
+            context = self._extract_onion_context(
+                f"{title or ''} {excerpt or ''}",
+                query,
+            )
+
+            finding_type = (
+                "forum_profile"
+                if context["found"]
+                else "url"
+            )
+
+            evidence = Evidence(
                 source="ahmia",
                 source_url=onion_url,
-                confidence=0.65,
+                title=title,
+                excerpt=excerpt,
                 metadata={
-                    "onion_url": onion_url,
-                    "source": "ahmia",
-                    "title": title,
-                    "excerpt": excerpt,
                     "matched_query": context["found"],
                     "context": context["context"],
                 },
             )
-            findings.append(finding)
+
+            findings.append(
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type=finding_type,
+                    value=onion_url,
+                    source="ahmia",
+                    source_url=onion_url,
+                    confidence=0.65
+                    if context["found"]
+                    else 0.55,
+                    evidence=[evidence],
+                    metadata={
+                        "onion_url": onion_url,
+                        "platform": "ahmia",
+                        "title": title,
+                        "excerpt": excerpt,
+                        "matched_query": context["found"],
+                        "context": context["context"],
+                        "query": query,
+                    },
+                )
+            )
 
         return findings
 
-    def _darksearch(self, query: str, iid: str, aid: str | None) -> list[Finding]:
-        """Search DarkSearch's public API and return matching results as findings."""
+    def _darksearch(
+        self,
+        query: str,
+        investigation_id: str,
+        actor_id: str | None,
+        run_id: str | None,
+    ) -> list[Finding]:
         try:
-            resp = requests.get(
+            response = requests.get(
                 "https://darksearch.io/api/search",
                 params={"query": query},
                 timeout=15,
+                headers={
+                    "User-Agent": (
+                        "PRALAYX-OSINT-Engine/1.0 "
+                        "(SIH26151; passive-index-search)"
+                    )
+                },
             )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
+
+            response.raise_for_status()
+
+            data = response.json()
+
+        except requests.RequestException:
+            return []
+        except ValueError:
             return []
 
-        results = data.get("data", [])
+        results = data.get(
+            "data",
+            [],
+        )
+
+        if not isinstance(
+            results,
+            list,
+        ):
+            return []
+
         findings: list[Finding] = []
 
         for item in results:
-            link = item.get("link", "")
-            title = item.get("title")
-            description = item.get("description")
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
 
-            context = self._extract_onion_context(
-                f"{title or ''} {description or ''}", query
+            link = str(
+                item.get(
+                    "link",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not link:
+                continue
+
+            title = item.get(
+                "title"
             )
 
-            finding_type = "forum_profile" if context["found"] else "url"
+            description = item.get(
+                "description"
+            )
 
-            finding = Finding(
-                investigation_id=iid,
-                actor_id=aid,
-                finding_type=finding_type,
-                value=link,
+            context = self._extract_onion_context(
+                f"{title or ''} {description or ''}",
+                query,
+            )
+
+            finding_type = (
+                "forum_profile"
+                if context["found"]
+                else "url"
+            )
+
+            evidence = Evidence(
                 source="darksearch",
                 source_url=link,
-                confidence=0.60,
+                title=title,
+                excerpt=description,
                 metadata={
-                    "title": title,
-                    "description": description,
                     "matched_query": context["found"],
                     "context": context["context"],
                 },
             )
-            findings.append(finding)
+
+            findings.append(
+                Finding(
+                    investigation_id=investigation_id,
+                    actor_id=actor_id,
+                    run_id=run_id,
+                    finding_type=finding_type,
+                    value=link,
+                    source="darksearch",
+                    source_url=link,
+                    confidence=0.60
+                    if context["found"]
+                    else 0.50,
+                    evidence=[evidence],
+                    metadata={
+                        "platform": "darksearch",
+                        "title": title,
+                        "description": description,
+                        "matched_query": context["found"],
+                        "context": context["context"],
+                        "query": query,
+                    },
+                )
+            )
 
         return findings
 
-    def _extract_onion_context(self, text: str, username: str) -> dict:
-        """Check whether the query term appears in text and return the surrounding context.
-
-        Returns {"found": bool, "context": str | None}, where context is
-        up to 200 characters centered on the match.
-        """
-        if not text or not username:
-            return {"found": False, "context": None}
+    def _extract_onion_context(
+        self,
+        text: str,
+        query: str,
+    ) -> dict:
+        if not text or not query:
+            return {
+                "found": False,
+                "context": None,
+            }
 
         lower_text = text.lower()
-        lower_query = username.lower()
-        idx = lower_text.find(lower_query)
+        lower_query = query.lower()
 
-        if idx == -1:
-            return {"found": False, "context": None}
+        index = lower_text.find(
+            lower_query
+        )
 
-        start = max(0, idx - 100)
-        end = min(len(text), idx + len(username) + 100)
-        return {"found": True, "context": text[start:end]}
+        if index == -1:
+            return {
+                "found": False,
+                "context": None,
+            }
+
+        start = max(
+            0,
+            index - 100,
+        )
+
+        end = min(
+            len(text),
+            index + len(query) + 100,
+        )
+
+        return {
+            "found": True,
+            "context": text[start:end],
+        }
+
+    @staticmethod
+    def _deduplicate(
+        findings: list[Finding],
+    ) -> list[Finding]:
+        seen: set[tuple[str, str]] = set()
+        result: list[Finding] = []
+
+        for finding in findings:
+            key = (
+                finding.source,
+                finding.source_url
+                or finding.value,
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(finding)
+
+        return result
