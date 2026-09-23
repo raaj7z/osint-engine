@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import uuid
 
 
 def utc_now() -> datetime:
@@ -29,9 +30,79 @@ class WatchlistEntry:
 
 
 class WatchlistStore:
-    def __init__(self, db: Any = None, db_path: str | None = None):
+    def __init__(
+        self,
+        db: Any = None,
+        db_path: str | None = None,
+    ):
         self.db = db
         self.db_path = db_path
+
+        if self.db is None:
+            raise RuntimeError(
+                "WatchlistStore requires the PRALAYX database"
+            )
+
+        self._ensure_table()
+
+    def _ensure_table(self) -> None:
+        self.db.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sih_watchlist (
+                watch_id TEXT PRIMARY KEY,
+                actor_id TEXT NOT NULL,
+                handle TEXT DEFAULT '',
+                identifiers TEXT DEFAULT '[]',
+                investigation_id TEXT,
+                interval_minutes INTEGER DEFAULT 360,
+                enabled INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'ACTIVE',
+                added_at TEXT NOT NULL,
+                last_scan_at TEXT,
+                next_scan_at TEXT,
+                notes TEXT DEFAULT '',
+                scan_count INTEGER DEFAULT 0,
+                metadata TEXT DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        self.db.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_sih_watchlist_actor
+            ON sih_watchlist(actor_id)
+            """
+        )
+
+        self.db.conn.commit()
+
+    @staticmethod
+    def _json(value: Any) -> str:
+        import json
+
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    @staticmethod
+    def _loads(value: Any, default: Any) -> Any:
+        import json
+
+        if value is None:
+            return default
+
+        try:
+            return json.loads(value)
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return default
 
     def add(
         self,
@@ -41,45 +112,146 @@ class WatchlistStore:
         interval_minutes: int = 360,
         notes: str = "",
         metadata: dict[str, Any] | None = None,
+        investigation_id: str | None = None,
     ) -> str:
-        interval_minutes = max(1, int(interval_minutes))
 
-        if self.db is not None:
-            watch_id = self.db.add_watchlist(
-                actor_id=actor_id,
-                interval_minutes=interval_minutes,
+        if not actor_id:
+            raise ValueError(
+                "actor_id is required"
             )
-            return watch_id
 
-        raise RuntimeError("WatchlistStore requires the PRALAYX database")
+        interval_minutes = max(
+            1,
+            int(interval_minutes),
+        )
 
-    def remove(self, watch_id: str) -> None:
-        if self.db is None:
-            raise RuntimeError("WatchlistStore requires the PRALAYX database")
+        watch_id = (
+            f"WATCH-{uuid.uuid4().hex[:12].upper()}"
+        )
 
-        self.db.remove_watchlist(watch_id)
+        now = utc_now()
 
-    def pause(self, watch_id: str) -> None:
-        self._set_state(watch_id, enabled=False)
+        next_scan = (
+            now
+            + timedelta(
+                minutes=interval_minutes
+            )
+        ).isoformat()
 
-    def resume(self, watch_id: str) -> None:
-        self._set_state(watch_id, enabled=True)
+        self.db.conn.execute(
+            """
+            INSERT INTO sih_watchlist
+            (
+                watch_id,
+                actor_id,
+                handle,
+                identifiers,
+                investigation_id,
+                interval_minutes,
+                enabled,
+                status,
+                added_at,
+                next_scan_at,
+                notes,
+                scan_count,
+                metadata,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1, 'ACTIVE',
+                    ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                watch_id,
+                actor_id,
+                handle or actor_id,
+                self._json(
+                    identifiers or []
+                ),
+                investigation_id,
+                interval_minutes,
+                now.isoformat(),
+                next_scan,
+                notes,
+                self._json(
+                    metadata or {}
+                ),
+                now.isoformat(),
+            ),
+        )
 
-    def get(self, watch_id: str) -> dict[str, Any] | None:
-        if self.db is None:
-            raise RuntimeError("WatchlistStore requires the PRALAYX database")
+        self.db.conn.commit()
 
-        for item in self.db.list_watchlist():
-            if item.get("watch_id") == watch_id:
-                return item
+        return watch_id
 
-        return None
+    def remove(
+        self,
+        watch_id: str,
+    ) -> None:
+
+        self.db.conn.execute(
+            """
+            DELETE FROM sih_watchlist
+            WHERE watch_id = ?
+            """,
+            (watch_id,),
+        )
+
+        self.db.conn.commit()
+
+    def pause(
+        self,
+        watch_id: str,
+    ) -> None:
+        self._set_state(
+            watch_id,
+            enabled=False,
+        )
+
+    def resume(
+        self,
+        watch_id: str,
+    ) -> None:
+        self._set_state(
+            watch_id,
+            enabled=True,
+        )
+
+    def get(
+        self,
+        watch_id: str,
+    ) -> dict[str, Any] | None:
+
+        row = self.db.conn.execute(
+            """
+            SELECT *
+            FROM sih_watchlist
+            WHERE watch_id = ?
+            """,
+            (watch_id,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        return self._row_to_dict(row)
 
     def list(self) -> list[dict[str, Any]]:
-        if self.db is None:
-            raise RuntimeError("WatchlistStore requires the PRALAYX database")
 
-        return self.db.list_watchlist()
+        rows = self.db.conn.execute(
+            """
+            SELECT *
+            FROM sih_watchlist
+            ORDER BY added_at DESC
+            """
+        ).fetchall()
+
+        return [
+            self._row_to_dict(row)
+            for row in rows
+        ]
+
+    def all_active(self) -> list[dict[str, Any]]:
+        return self.active()
 
     def active(self) -> list[dict[str, Any]]:
         return [
@@ -95,7 +267,11 @@ class WatchlistStore:
             if self._is_due(item)
         ]
 
-    def mark_scanned(self, watch_id: str) -> None:
+    def mark_scanned(
+        self,
+        watch_id: str,
+    ) -> None:
+
         item = self.get(watch_id)
 
         if not item:
@@ -103,52 +279,196 @@ class WatchlistStore:
 
         interval = max(
             1,
-            int(item.get("interval_minutes") or 360),
+            int(
+                item.get(
+                    "interval_minutes",
+                    360,
+                )
+                or 360
+            ),
         )
 
-        self._update(
-            watch_id,
-            last_scan_at=iso_now(),
-            next_scan_at=(
-                utc_now() + timedelta(minutes=interval)
-            ).isoformat(),
+        now = utc_now()
+
+        self.db.conn.execute(
+            """
+            UPDATE sih_watchlist
+            SET
+                last_scan_at = ?,
+                next_scan_at = ?,
+                scan_count = scan_count + 1,
+                updated_at = ?
+            WHERE watch_id = ?
+            """,
+            (
+                now.isoformat(),
+                (
+                    now
+                    + timedelta(
+                        minutes=interval
+                    )
+                ).isoformat(),
+                now.isoformat(),
+                watch_id,
+            ),
         )
+
+        self.db.conn.commit()
 
     def stats(self) -> dict[str, int]:
         items = self.list()
 
         active = [
-            item for item in items
+            item
+            for item in items
             if self._is_active(item)
         ]
 
         paused = [
-            item for item in items
-            if str(item.get("enabled", "")).lower()
-            in {"0", "false", "none"}
+            item
+            for item in items
+            if not self._is_active(item)
+        ]
+
+        due = [
+            item
+            for item in active
+            if self._is_due(item)
         ]
 
         return {
             "total": len(items),
             "active": len(active),
             "paused": len(paused),
-            "due": len(self.due()),
+            "due": len(due),
         }
 
-    def _is_active(self, item: dict[str, Any]) -> bool:
-        enabled = item.get("enabled", True)
+    def get_stats(self) -> dict[str, int]:
+        return self.stats()
 
-        if isinstance(enabled, str):
-            enabled = enabled.lower() not in {
-                "0",
-                "false",
-                "no",
-                "disabled",
-            }
+    def _set_state(
+        self,
+        watch_id: str,
+        enabled: bool,
+    ) -> None:
+
+        now = iso_now()
+
+        self.db.conn.execute(
+            """
+            UPDATE sih_watchlist
+            SET
+                enabled = ?,
+                status = ?,
+                updated_at = ?
+            WHERE watch_id = ?
+            """,
+            (
+                1 if enabled else 0,
+                "ACTIVE" if enabled else "PAUSED",
+                now,
+                watch_id,
+            ),
+        )
+
+        self.db.conn.commit()
+
+    def _update(
+        self,
+        watch_id: str,
+        **fields: Any,
+    ) -> None:
+
+        allowed = {
+            "enabled",
+            "last_scan_at",
+            "next_scan_at",
+            "interval_minutes",
+            "status",
+            "notes",
+            "handle",
+            "identifiers",
+            "metadata",
+        }
+
+        updates = {
+            key: value
+            for key, value in fields.items()
+            if key in allowed
+        }
+
+        if not updates:
+            return
+
+        assignments = []
+        values = []
+
+        for key, value in updates.items():
+
+            if key in {
+                "identifiers",
+                "metadata",
+            }:
+                value = self._json(value)
+
+            assignments.append(
+                f"{key} = ?"
+            )
+            values.append(value)
+
+        assignments.append(
+            "updated_at = ?"
+        )
+        values.append(
+            iso_now()
+        )
+
+        values.append(
+            watch_id
+        )
+
+        self.db.conn.execute(
+            f"""
+            UPDATE sih_watchlist
+            SET {", ".join(assignments)}
+            WHERE watch_id = ?
+            """,
+            tuple(values),
+        )
+
+        self.db.conn.commit()
+
+    def _is_active(
+        self,
+        item: dict[str, Any],
+    ) -> bool:
+
+        enabled = item.get(
+            "enabled",
+            True,
+        )
+
+        if isinstance(
+            enabled,
+            str,
+        ):
+            enabled = (
+                enabled.lower()
+                not in {
+                    "0",
+                    "false",
+                    "no",
+                    "disabled",
+                }
+            )
 
         return bool(enabled)
 
-    def _is_due(self, item: dict[str, Any]) -> bool:
+    def _is_due(
+        self,
+        item: dict[str, Any],
+    ) -> bool:
+
         if not self._is_active(item):
             return False
 
@@ -170,75 +490,47 @@ class WatchlistStore:
 
             if parsed.tzinfo is None:
                 parsed = parsed.replace(
-                    tzinfo=timezone.utc,
+                    tzinfo=timezone.utc
                 )
 
             return parsed <= utc_now()
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return True
 
-    def _set_state(
+    def _row_to_dict(
         self,
-        watch_id: str,
-        enabled: bool,
-    ) -> None:
-        self._update(
-            watch_id,
-            enabled=1 if enabled else 0,
+        row: Any,
+    ) -> dict[str, Any]:
+
+        item = dict(row)
+
+        item["identifiers"] = self._loads(
+            item.get("identifiers"),
+            [],
         )
 
-    def _update(
-        self,
-        watch_id: str,
-        **fields: Any,
-    ) -> None:
-        if self.db is None:
-            raise RuntimeError("WatchlistStore requires the PRALAYX database")
+        item["metadata"] = self._loads(
+            item.get("metadata"),
+            {},
+        )
 
-        allowed = {
-            "enabled",
-            "last_scan_at",
-            "next_scan_at",
-            "interval_minutes",
-        }
+        item["next_scan"] = item.get(
+            "next_scan_at"
+        )
 
-        updates = {
-            key: value
-            for key, value in fields.items()
-            if key in allowed
-        }
+        item["last_scanned"] = item.get(
+            "last_scan_at"
+        )
 
-        if not updates:
-            return
+        item["active"] = self._is_active(
+            item
+        )
 
-        try:
-            self.db.execute(
-                """
-                UPDATE sih_watchlist
-                SET
-                    enabled = COALESCE(?, enabled),
-                    last_scan_at = COALESCE(?, last_scan_at),
-                    next_scan_at = COALESCE(?, next_scan_at),
-                    interval_minutes = COALESCE(?, interval_minutes),
-                    updated_at = ?
-                WHERE watch_id = ?
-                """,
-                (
-                    updates.get("enabled"),
-                    updates.get("last_scan_at"),
-                    updates.get("next_scan_at"),
-                    updates.get("interval_minutes"),
-                    iso_now(),
-                    watch_id,
-                ),
-            )
-        except Exception:
-            try:
-                self.db.conn.rollback()
-            except Exception:
-                pass
-            raise
+        return item
 
 
 __all__ = [
