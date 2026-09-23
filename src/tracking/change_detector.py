@@ -77,20 +77,14 @@ def finding_key(finding: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def confidence_of(
-    finding: dict[str, Any],
-) -> float:
+def confidence_of(finding: dict[str, Any]) -> float:
     try:
-        return float(
-            finding.get("confidence", 0.0)
-        )
+        return float(finding.get("confidence", 0.0))
     except (TypeError, ValueError):
         return 0.0
 
 
-def _looks_like_post(
-    finding: dict[str, Any],
-) -> bool:
+def _looks_like_post(finding: dict[str, Any]) -> bool:
     return any(
         finding.get(field)
         for field in (
@@ -118,8 +112,7 @@ def _materially_changed(
     }
 
     keys = (
-        set(before.keys())
-        | set(after.keys())
+        set(before.keys()) | set(after.keys())
     ) - ignored
 
     return any(
@@ -270,10 +263,7 @@ def detect_changes(
     previous: Iterable[dict[str, Any]],
     current: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
-    return compare_findings(
-        previous,
-        current,
-    )
+    return compare_findings(previous, current)
 
 
 def build_change_events(
@@ -281,10 +271,7 @@ def build_change_events(
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
-    for finding in changes.get(
-        "new_platforms",
-        [],
-    ):
+    for finding in changes.get("new_platforms", []):
         events.append(
             {
                 "event_type": "new_platform",
@@ -297,10 +284,7 @@ def build_change_events(
             }
         )
 
-    for finding in changes.get(
-        "new_posts",
-        [],
-    ):
+    for finding in changes.get("new_posts", []):
         events.append(
             {
                 "event_type": "new_post",
@@ -313,10 +297,7 @@ def build_change_events(
             }
         )
 
-    for finding in changes.get(
-        "new_wallets",
-        [],
-    ):
+    for finding in changes.get("new_wallets", []):
         events.append(
             {
                 "event_type": "new_wallet",
@@ -329,10 +310,7 @@ def build_change_events(
             }
         )
 
-    for finding in changes.get(
-        "new_aliases",
-        [],
-    ):
+    for finding in changes.get("new_aliases", []):
         events.append(
             {
                 "event_type": "new_alias",
@@ -345,14 +323,8 @@ def build_change_events(
             }
         )
 
-    for change in changes.get(
-        "profile_changes",
-        [],
-    ):
-        after = change.get(
-            "after",
-            {},
-        )
+    for change in changes.get("profile_changes", []):
+        after = change.get("after", {})
 
         events.append(
             {
@@ -363,16 +335,11 @@ def build_change_events(
                     f"{value_of(after)}"
                 ),
                 "finding": after,
-                "before": change.get(
-                    "before",
-                ),
+                "before": change.get("before"),
             }
         )
 
-    for finding in changes.get(
-        "high_confidence",
-        [],
-    ):
+    for finding in changes.get("high_confidence", []):
         events.append(
             {
                 "event_type": "high_confidence_finding",
@@ -391,56 +358,55 @@ def build_change_events(
 def summarize_changes(
     changes: dict[str, Any],
 ) -> dict[str, Any]:
-    counts = changes.get(
-        "counts",
-        {},
-    )
+    counts = changes.get("counts", {})
 
     return {
-        "new_findings": counts.get(
-            "added",
-            0,
-        ),
-        "removed_findings": counts.get(
-            "removed",
-            0,
-        ),
-        "changed_findings": counts.get(
-            "changed",
-            0,
-        ),
-        "new_platforms": counts.get(
-            "new_platforms",
-            0,
-        ),
-        "new_posts": counts.get(
-            "new_posts",
-            0,
-        ),
-        "new_wallets": counts.get(
-            "new_wallets",
-            0,
-        ),
-        "new_aliases": counts.get(
-            "new_aliases",
-            0,
-        ),
-        "profile_changes": counts.get(
-            "profile_changes",
-            0,
-        ),
-        "high_confidence": counts.get(
-            "high_confidence",
-            0,
-        ),
-        "checked_at": changes.get(
-            "checked_at",
-        ),
+        "new_findings": counts.get("added", 0),
+        "removed_findings": counts.get("removed", 0),
+        "changed_findings": counts.get("changed", 0),
+        "new_platforms": counts.get("new_platforms", 0),
+        "new_posts": counts.get("new_posts", 0),
+        "new_wallets": counts.get("new_wallets", 0),
+        "new_aliases": counts.get("new_aliases", 0),
+        "profile_changes": counts.get("profile_changes", 0),
+        "high_confidence": counts.get("high_confidence", 0),
+        "checked_at": changes.get("checked_at"),
     }
+
+
+class ChangeDetector:
+    """State-free change detector wrapper."""
+
+    def compare(
+        self,
+        previous: Iterable[dict[str, Any]],
+        current: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return compare_findings(previous, current)
+
+    def detect(
+        self,
+        previous: Iterable[dict[str, Any]],
+        current: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return detect_changes(previous, current)
+
+    def build_events(
+        self,
+        changes: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        return build_change_events(changes)
+
+    def summarize(
+        self,
+        changes: dict[str, Any],
+    ) -> dict[str, Any]:
+        return summarize_changes(changes)
 
 
 __all__ = [
     "HIGH_CONFIDENCE_THRESHOLD",
+    "ChangeDetector",
     "compare_findings",
     "detect_changes",
     "build_change_events",
