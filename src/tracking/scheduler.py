@@ -13,20 +13,14 @@ class WatchlistScheduler:
     def __init__(
         self,
         watchlist_store: Any,
-        callback: Callable[
-            [dict[str, Any]],
-            Any,
-        ],
+        callback: Callable[[dict[str, Any]], Any],
         alert_manager: Any = None,
         tick_seconds: int = 15,
     ):
         self.watchlist_store = watchlist_store
         self.callback = callback
         self.alert_manager = alert_manager
-        self.tick_seconds = max(
-            1,
-            int(tick_seconds),
-        )
+        self.tick_seconds = max(1, int(tick_seconds))
 
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -53,13 +47,9 @@ class WatchlistScheduler:
             )
 
             self.thread.start()
-
             return True
 
-    def stop(
-        self,
-        timeout: float = 5.0,
-    ) -> bool:
+    def stop(self, timeout: float = 5.0) -> bool:
         self.stop_event.set()
 
         thread = self.thread
@@ -102,8 +92,9 @@ class WatchlistScheduler:
             return []
 
         for entry in due_entries:
-            result = self._process(entry)
-            processed.append(result)
+            processed.append(
+                self._process(entry)
+            )
 
         self.last_results = processed
 
@@ -132,7 +123,7 @@ class WatchlistScheduler:
             if watch_id:
                 try:
                     self.watchlist_store.mark_scanned(
-                        watch_id,
+                        watch_id
                     )
                 except Exception:
                     pass
@@ -181,10 +172,203 @@ class WatchlistScheduler:
         }
 
 
+class ScanScheduler:
+    """
+    Compatibility wrapper used by the interactive OSINT CLI.
+
+    It keeps the CLI-facing constructor compatible while using
+    the same watchlist scheduler implementation underneath.
+    """
+
+    def __init__(
+        self,
+        engine: Any,
+        watchlist_store: Any,
+        alert_manager: Any = None,
+        change_detector: Any = None,
+        tick_seconds: int = 15,
+    ):
+        self.engine = engine
+        self.watchlist_store = watchlist_store
+        self.alert_manager = alert_manager
+        self.change_detector = change_detector
+
+        callback = self._scan_entry
+
+        self.scheduler = WatchlistScheduler(
+            watchlist_store=watchlist_store,
+            callback=callback,
+            alert_manager=alert_manager,
+            tick_seconds=tick_seconds,
+        )
+
+    def _scan_entry(
+        self,
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Execute a scheduled actor scan when the entry contains
+        usable identifiers. Otherwise return a controlled status.
+        """
+
+        actor_id = entry.get("actor_id")
+
+        identifiers = (
+            entry.get("identifiers")
+            or []
+        )
+
+        if not identifiers:
+            return {
+                "actor_id": actor_id,
+                "status": "NO_RESULTS",
+                "message": (
+                    "No identifiers available "
+                    "for scheduled scan."
+                ),
+            }
+
+        try:
+            from ..models import (
+                Identifier,
+                InvestigationInput,
+            )
+
+            normalized = []
+
+            for item in identifiers:
+                if isinstance(item, Identifier):
+                    normalized.append(item)
+                    continue
+
+                if not isinstance(item, dict):
+                    continue
+
+                value = (
+                    item.get("value")
+                    or item.get("identifier")
+                )
+
+                id_type = (
+                    item.get("type")
+                    or item.get("finding_type")
+                    or "other"
+                )
+
+                if value:
+                    normalized.append(
+                        Identifier(
+                            type=id_type,
+                            value=str(value),
+                            source=item.get(
+                                "source",
+                                "watchlist",
+                            ),
+                            source_url=item.get(
+                                "source_url"
+                            ),
+                            confidence=float(
+                                item.get(
+                                    "confidence",
+                                    1.0,
+                                )
+                            ),
+                            metadata=item.get(
+                                "metadata",
+                                {},
+                            ),
+                        )
+                    )
+
+            if not normalized:
+                return {
+                    "actor_id": actor_id,
+                    "status": "NO_RESULTS",
+                    "message": (
+                        "No valid identifiers "
+                        "available for scheduled scan."
+                    ),
+                }
+
+            investigation_id = (
+                entry.get("investigation_id")
+                or f"MON-{actor_id or 'UNKNOWN'}-"
+                f"{int(datetime.now(timezone.utc).timestamp())}"
+            )
+
+            run_id = (
+                entry.get("run_id")
+                or f"RUN-{int(datetime.now(timezone.utc).timestamp())}"
+            )
+
+            investigation = InvestigationInput(
+                investigation_id=investigation_id,
+                actor_id=actor_id,
+                run_id=run_id,
+                identifiers=normalized,
+                metadata={
+                    "trigger": "scheduled_monitoring",
+                    "watch_id": entry.get(
+                        "watch_id"
+                    ),
+                },
+            )
+
+            result = self.engine.run(
+                investigation
+            )
+
+            return {
+                "actor_id": actor_id,
+                "investigation_id": investigation_id,
+                "run_id": run_id,
+                "status": getattr(
+                    result,
+                    "status",
+                    "COMPLETED",
+                ),
+                "findings": len(
+                    getattr(
+                        result,
+                        "findings",
+                        [],
+                    )
+                ),
+            }
+
+        except Exception as exc:
+            return {
+                "actor_id": actor_id,
+                "status": "ERROR",
+                "error": str(exc),
+            }
+
+    def start(self) -> bool:
+        return self.scheduler.start()
+
+    def stop(
+        self,
+        timeout: float = 5.0,
+    ) -> bool:
+        return self.scheduler.stop(
+            timeout=timeout
+        )
+
+    def running(self) -> bool:
+        return self.scheduler.running()
+
+    def tick(self) -> list[dict[str, Any]]:
+        return self.scheduler.tick()
+
+    def status(self) -> dict[str, Any]:
+        return self.scheduler.status()
+
+
 Scheduler = WatchlistScheduler
 
 
 __all__ = [
     "WatchlistScheduler",
+    "ScanScheduler",
     "Scheduler",
 ]
