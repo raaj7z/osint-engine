@@ -39,9 +39,18 @@ class WatchlistStore:
         self.db_path = db_path
 
         if self.db is None:
-            raise RuntimeError(
-                "WatchlistStore requires the PRALAYX database"
-            )
+            import os
+            import sqlite3
+            path = db_path or os.path.join("data", "osint.db")
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            conn = sqlite3.connect(path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+
+            class _LocalDB:
+                def __init__(self, c):
+                    self.conn = c
+
+            self.db = _LocalDB(conn)
 
         self._ensure_table()
 
