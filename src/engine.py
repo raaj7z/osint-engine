@@ -453,24 +453,39 @@ class OSINTEngine:
 
         try:
             if kind == "scanner":
-                raw_findings = component.scan(
-                    identifier,
-                    investigation.investigation_id,
-                    investigation.actor_id,
-                    investigation.run_id,
-                )
+                try:
+                    raw_findings = component.scan(
+                        identifier,
+                        investigation.investigation_id,
+                        investigation.actor_id,
+                        investigation.run_id,
+                    )
+                except TypeError:
+                    raw_findings = component.scan(
+                        identifier,
+                        investigation.investigation_id,
+                        investigation.actor_id,
+                    )
 
             else:
-                raw_findings = component.query(
-                    identifier,
-                    investigation.investigation_id,
-                    investigation.actor_id,
-                    investigation.run_id,
-                )
+                try:
+                    raw_findings = component.query(
+                        identifier,
+                        investigation.investigation_id,
+                        investigation.actor_id,
+                        investigation.run_id,
+                    )
+                except TypeError:
+                    raw_findings = component.query(
+                        identifier,
+                        investigation.investigation_id,
+                        investigation.actor_id,
+                    )
 
             findings = list(
                 raw_findings or []
             )
+
 
             completed_at = _utc_now()
 
